@@ -4,11 +4,10 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 from url_detector import extract_url, detect_platform
-from downloader import download_media, get_clean_url
+from downloader import download_media, download_reddit_image, get_clean_url
 from formatter import format_message
 
 logger = logging.getLogger(__name__)
-
 MAX_FILE_SIZE_MB = 50
 
 
@@ -35,17 +34,24 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     processing_msg = await update.message.reply_text("⏳ Descargando contenido...")
 
     try:
-        file_path, info = download_media(url)
+        file_path, info = download_media(url, platform)
+
+        # Reddit fallback: if yt-dlp fails, try JSON API for images
+        if (not file_path) and platform in ("reddit",):
+            file_path, info = download_reddit_image(url)
 
         if not file_path or not info:
             await processing_msg.edit_text(
                 "❌ No pude descargar ese contenido.\n"
-                "Puede que sea privado o que la red social lo esté bloqueando."
+                "Puede que sea privado, requiera login, o la red social lo esté bloqueando."
             )
             return
 
         clean_url = get_clean_url(info)
-        caption_text = format_message(platform, info, clean_url)
+
+        # Use "redgifs" formatter key for redgifs platform
+        formatter_key = "reddit" if platform == "redgifs" else platform
+        caption_text = format_message(formatter_key, info, clean_url)
 
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
         ext = os.path.splitext(file_path)[1].lower()
@@ -54,19 +60,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if ext in (".jpg", ".jpeg", ".png", ".webp"):
             with open(file_path, "rb") as f:
-                await update.message.reply_photo(photo=f, caption=caption_text, parse_mode="Markdown")
+                await update.message.reply_photo(
+                    photo=f, caption=caption_text, parse_mode="Markdown"
+                )
         elif ext in (".gif",):
             with open(file_path, "rb") as f:
-                await update.message.reply_animation(animation=f, caption=caption_text, parse_mode="Markdown")
+                await update.message.reply_animation(
+                    animation=f, caption=caption_text, parse_mode="Markdown"
+                )
         elif file_size_mb > MAX_FILE_SIZE_MB:
             await update.message.reply_text(
-                f"⚠️ El archivo pesa más de {MAX_FILE_SIZE_MB}MB, no puedo enviarlo directamente.\n\n" + caption_text,
+                f"⚠️ El archivo pesa más de {MAX_FILE_SIZE_MB}MB, no puedo enviarlo directamente.\n\n"
+                + caption_text,
                 parse_mode="Markdown",
-                disable_web_page_preview=False
+                disable_web_page_preview=False,
             )
         else:
             with open(file_path, "rb") as f:
-                await update.message.reply_video(video=f, caption=caption_text, parse_mode="Markdown", supports_streaming=True)
+                await update.message.reply_video(
+                    video=f,
+                    caption=caption_text,
+                    parse_mode="Markdown",
+                    supports_streaming=True,
+                )
 
         try:
             os.remove(file_path)
