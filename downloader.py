@@ -51,7 +51,7 @@ def _base_ydl_opts(output_dir: str, platform: str = None) -> dict:
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4",
-        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=webm]/best",
+        "format": "bestvideo+bestaudio/best",
         "noplaylist": True,
         "socket_timeout": 30,
         "extractor_args": {"youtube": {"player_client": ["ios", "mweb"]}},
