@@ -51,7 +51,7 @@ def _base_ydl_opts(output_dir: str, platform: str = None) -> dict:
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4",
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=webm]/best",
         "noplaylist": True,
         "socket_timeout": 30,
     }
