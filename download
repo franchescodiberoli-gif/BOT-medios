@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+cookies.txt
+downloads/
+*.mp4
+*.jpg
+*.png
+*.gif
