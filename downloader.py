@@ -68,23 +68,18 @@ def _extract_video_id(url: str) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ESTRATEGIA 1: cobalt.tools — gratis, sin cookies, para siempre
+# ESTRATEGIA 1: cobalt.tools
 # ═══════════════════════════════════════════════════════════════════
-# cobalt es open-source: https://github.com/imputnet/cobalt
-# Instancias públicas gratuitas que no requieren autenticación.
-# Si una falla, prueba la siguiente.
 
 COBALT_INSTANCES = [
     "https://api.cobalt.tools",
     "https://cobalt.api.timelessnesses.me",
     "https://cob.frytea.com",
-    "https://cobalt.ycnmhvap.dedyn.io",
     "https://cobalt.gnome.moe",
 ]
 
 
 def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
-    """Descarga un archivo desde URL directa."""
     try:
         tmp = os.path.join(tempfile.mkdtemp(), f"video.{ext}")
         hdrs = {"User-Agent": "Mozilla/5.0 (compatible; MediaBot/2.0)"}
@@ -101,29 +96,22 @@ def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
 
 
 def _try_cobalt(url: str) -> tuple[str | None, dict | None]:
-    """
-    Descarga via cobalt.tools API.
-    - Completamente gratuito y open-source
-    - Sin cookies ni autenticación
-    - Funciona desde IPs de servidores cloud
-    - Prueba múltiples instancias si una falla
-    """
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": "MediaBot/2.0",
     }
+    # cobalt v10: solo estos campos, sin "downloadMode"
     payload = {
         "url": url,
         "videoQuality": "720",
         "filenameStyle": "basic",
-        "downloadMode": "auto",
     }
 
     for instance in COBALT_INSTANCES:
         try:
             logger.info(f"→ cobalt [{instance}]...")
-            r = requests.post(instance, json=payload, headers=headers, timeout=25)
+            r = requests.post(instance, json=payload, headers=headers, timeout=25, verify=False)
             if r.status_code == 429:
                 logger.warning(f"  cobalt {instance} → rate limit, siguiente...")
                 continue
@@ -166,26 +154,21 @@ def _try_cobalt(url: str) -> tuple[str | None, dict | None]:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ESTRATEGIA 2: yt-dlp con clientes sin PO Token + Node.js runtime
+# ESTRATEGIA 2: yt-dlp tv_embedded + mweb (sin cookies)
 # ═══════════════════════════════════════════════════════════════════
-# Requiere: nodejs instalado en packages.txt
-# Clientes que NO piden PO Token ni cookies: tv_embedded, mweb, tv
+
+def _get_js_runtimes() -> dict:
+    import shutil
+    node_path = shutil.which("node") or shutil.which("nodejs") or "/usr/bin/nodejs"
+    return {"node": {"path": node_path}}
+
 
 def _try_ytdlp_no_cookies(url: str, cookies: str | None) -> tuple[str | None, dict | None]:
-    """
-    yt-dlp con clientes que no requieren cookies desde cloud IPs.
-    Usa Node.js como runtime de JavaScript (requerido por yt-dlp 2026+).
-    """
     FORMAT = (
         "bestvideo[height<=720][vcodec!*=av01]+bestaudio"
         "/bestvideo[height<=720]+bestaudio"
         "/best[height<=720]/best"
     )
-
-    # Detectar ruta de node.js
-    import shutil
-    node_path = shutil.which("node") or shutil.which("nodejs")
-    js_runtimes = f"node:{node_path}" if node_path else "node"
 
     base_opts = {
         "quiet":               True,
@@ -195,14 +178,11 @@ def _try_ytdlp_no_cookies(url: str, cookies: str | None) -> tuple[str | None, di
         "socket_timeout":      60,
         "nocheckcertificate":  True,
         "format":              FORMAT,
-        "js_runtimes":         js_runtimes,  # ← Node.js para yt-dlp 2026+
+        "js_runtimes":         _get_js_runtimes(),
     }
     if cookies:
         base_opts["cookiefile"] = cookies
 
-    # tv_embedded: mejor opción, no requiere PO token ni cookies
-    # mweb: mobile web, sin bot detection agresiva
-    # tv: TV estándar
     for client in ["tv_embedded", "mweb", "tv"]:
         tmp_dir = tempfile.mkdtemp()
         opts = {
@@ -222,7 +202,7 @@ def _try_ytdlp_no_cookies(url: str, cookies: str | None) -> tuple[str | None, di
         except Exception as e:
             err = str(e)
             if "DRM" in err:
-                return None, None  # Sin solución posible
+                return None, None
             if "Private video" in err or "private" in err.lower():
                 return None, None
             logger.warning(f"[{client}] {err[:120]}")
@@ -231,20 +211,15 @@ def _try_ytdlp_no_cookies(url: str, cookies: str | None) -> tuple[str | None, di
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ESTRATEGIA 3: yt-dlp legacy (android/ios/web + cookies opcionales)
+# ESTRATEGIA 3: yt-dlp legacy (ios/android/web)
 # ═══════════════════════════════════════════════════════════════════
 
 def _try_ytdlp_legacy(url: str, cookies: str | None) -> tuple[str | None, dict | None]:
-    """Fallback final con clientes que se benefician de cookies."""
-    import shutil
-    node_path = shutil.which("node") or shutil.which("nodejs")
-    js_runtimes = f"node:{node_path}" if node_path else "node"
-
     base_opts = {
         "quiet": True, "no_warnings": True, "merge_output_format": "mp4",
         "noplaylist": True, "socket_timeout": 60, "nocheckcertificate": True,
         "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        "js_runtimes": js_runtimes,
+        "js_runtimes": _get_js_runtimes(),
     }
     if cookies:
         base_opts["cookiefile"] = cookies
@@ -275,12 +250,6 @@ def _try_ytdlp_legacy(url: str, cookies: str | None) -> tuple[str | None, dict |
 # ═══════════════════════════════════════════════════════════════════
 
 def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
-    """
-    3 estrategias en cascada:
-      1. cobalt.tools API      — sin cookies, sin auth, gratis para siempre
-      2. yt-dlp tv_embedded    — sin cookies, funciona en cloud con Node.js
-      3. yt-dlp legacy         — fallback final, con cookies opcionales
-    """
     cookies = _cookies(platform)
 
     logger.info("🔄 [1/3] cobalt.tools...")
