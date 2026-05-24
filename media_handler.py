@@ -65,6 +65,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clean_url    = get_clean_url(info)
         caption_text = format_message(platform, info, clean_url)
 
+        # Twitter imagen: file_path puede ser "URL:https://..." para envío directo
+        if isinstance(file_path, str) and file_path.startswith("URL:"):
+            img_url = file_path[4:]
+            await processing_msg.delete()
+            await update.message.reply_photo(photo=img_url, caption=caption_text, parse_mode="Markdown")
+            return
+
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
         ext = os.path.splitext(file_path)[1].lower()
 
