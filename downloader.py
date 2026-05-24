@@ -252,8 +252,10 @@ def download_redgifs(url: str) -> tuple[str | None, dict | None]:
         r.raise_for_status()
         gif   = r.json().get("gif", {})
         urls  = gif.get("urls", {})
-        title = gif.get("title") or gif_id
+        # title suele venir vacío; description tiene el texto real del post
+        title = (gif.get("description") or gif.get("title") or "").strip()
         tags  = gif.get("tags", [])
+        user  = gif.get("userName", "")
 
         video_url = urls.get("hd") or urls.get("sd") or urls.get("gif")
         if not video_url:
@@ -274,6 +276,7 @@ def download_redgifs(url: str) -> tuple[str | None, dict | None]:
             info = {
                 "id":            gif_id,
                 "title":         title,
+                "uploader":      user,
                 "tags":          tags,
                 "description":   " ".join(f"#{t}" for t in tags),
                 "webpage_url":   f"https://www.redgifs.com/watch/{gif_id}",
