@@ -387,13 +387,10 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
 
 def _get_twitter_image_url(url: str) -> tuple[str | None, dict | None]:
     """
-    Devuelve la URL directa de la imagen del tweet (sin descargar).
-    Intenta: API v1.1 → GraphQL (múltiples query IDs).
+    Obtiene la imagen de un tweet usando fxtwitter (no requiere auth)
+    como método principal, con syndication como fallback.
     Retorna ("URL:https://...", info) cuando tiene éxito.
     """
-    import json as _json
-    import urllib.parse
-
     m = re.search(r"status/(\d+)", url)
     tweet_id = m.group(1) if m else None
     if not tweet_id:
@@ -407,140 +404,98 @@ def _get_twitter_image_url(url: str) -> tuple[str | None, dict | None]:
         "extractor_key": "Twitter",
     }
 
-    # Parsear cookies JSON para construir cabeceras
-    raw = (os.environ.get("TWITTER_COOKIES") or "").strip()
-    auth_token, ct0 = "", ""
-    if raw.startswith("["):
-        try:
-            for c in _json.loads(raw):
-                if c.get("name") == "auth_token": auth_token = c.get("value", "")
-                if c.get("name") == "ct0":        ct0        = c.get("value", "")
-        except Exception:
-            pass
-
-    if not auth_token:
-        return None, None
-
-    headers = {
-        "User-Agent":              "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-        "Authorization":           "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
-        "x-csrf-token":            ct0,
-        "Cookie":                  f"auth_token={auth_token}; ct0={ct0}",
-        "x-twitter-auth-type":     "OAuth2Session",
-        "x-twitter-client-language": "en",
-        "x-twitter-active-user":   "yes",
-        "Accept":                  "application/json",
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "Accept":     "application/json",
     }
 
-    def _build_info_from_media(media_list: list, text: str) -> tuple[str | None, dict | None]:
-        """Extrae la primera foto de media_list y retorna (URL_string, info)."""
-        photos = [md for md in media_list if md.get("type") == "photo"]
-        for photo in photos:
-            img_url = photo.get("media_url_https", "")
-            if img_url:
-                img_url_large = img_url + "?name=large"
-                # Guardar todas las imágenes para soporte futuro de galerías
-                all_images = [
-                    p.get("media_url_https", "") + "?name=large"
-                    for p in photos if p.get("media_url_https")
-                ]
-                info = {
-                    **base_info,
-                    "title":       (text[:100] if text else "") or base_info["title"],
-                    "description": text,
-                    "ext":         "jpg",
-                    "all_images":  all_images,
-                }
-                return f"URL:{img_url_large}", info
-        return None, None
+    # ── Método 1: fxtwitter — no requiere cookies ni query IDs ──────
+    # API pública estable: https://github.com/FixTweet/FxTwitter
+    for fx_host in ("api.fxtwitter.com", "api.vxtwitter.com"):
+        try:
+            r = requests.get(
+                f"https://{fx_host}/status/{tweet_id}",
+                headers=hdrs, timeout=20, verify=False,
+            )
+            if r.status_code == 200:
+                data  = r.json()
+                tweet = data.get("tweet", {})
+                text  = tweet.get("text", "")
+                media = tweet.get("media", {})
 
-    # ── Método 1: API v1.1 statuses/show (más estable que GraphQL) ──
+                # fxtwitter devuelve fotos en "photos" o mezcladas en "all"
+                photos = media.get("photos") or []
+                if not photos:
+                    # filtrar del array "all" los que sean tipo photo/image
+                    photos = [
+                        item for item in (media.get("all") or [])
+                        if item.get("type") in ("photo", "image")
+                    ]
+
+                if photos:
+                    img_url = photos[0].get("url", "")
+                    if img_url:
+                        all_images = [p.get("url", "") for p in photos if p.get("url")]
+                        info = {
+                            **base_info,
+                            "title":       text[:100] or base_info["title"],
+                            "description": text,
+                            "ext":         "jpg",
+                            "all_images":  all_images,
+                        }
+                        return f"URL:{img_url}", info
+            else:
+                logger.warning(f"fxtwitter [{fx_host}]: {r.status_code}")
+        except Exception as e:
+            logger.warning(f"_get_twitter_image_url fxtwitter [{fx_host}]: {e}")
+
+    # ── Método 2: Syndication API (fallback) ────────────────────────
     try:
-        api_url = (
-            f"https://api.twitter.com/1.1/statuses/show.json"
-            f"?id={tweet_id}&tweet_mode=extended&include_entities=true"
+        import math as _math
+        val   = (int(tweet_id) / 1e15) * _math.pi
+        chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+        ip    = int(abs(val))
+        is_   = ""
+        if ip == 0:
+            is_ = "0"
+        else:
+            t = ip
+            while t:
+                is_ = chars[t % 36] + is_
+                t //= 36
+        fp_   = abs(val) - ip
+        fs_   = ""
+        for _ in range(8):
+            fp_ *= 36
+            d    = min(int(fp_), 35)
+            fs_ += chars[d]
+            fp_ -= d
+        token = (is_ + "." + fs_).rstrip("0").rstrip(".")
+
+        r = requests.get(
+            f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&lang=en&token={token}",
+            headers={**hdrs, "Referer": "https://platform.twitter.com/",
+                     "Origin": "https://platform.twitter.com"},
+            timeout=20, verify=False,
         )
-        r = requests.get(api_url, headers=headers, timeout=20,
-                         proxies=PROXIES, verify=False)
         if r.status_code == 200:
             data = r.json()
-            media_list = (
-                data.get("extended_entities", {}).get("media") or
-                data.get("entities", {}).get("media") or []
-            )
-            text = data.get("full_text", "") or data.get("text", "")
-            fp, info = _build_info_from_media(media_list, text)
-            if fp:
-                return fp, info
+            for item in (data.get("mediaDetails") or []):
+                if item.get("type") == "photo":
+                    img_url = item.get("media_url_https", "")
+                    if img_url:
+                        text = data.get("text", "")
+                        info = {
+                            **base_info,
+                            "title":       text[:100] or base_info["title"],
+                            "description": text,
+                            "ext":         "jpg",
+                        }
+                        return f"URL:{img_url}?name=large", info
         else:
-            logger.warning(f"Twitter v1.1 API: {r.status_code}")
+            logger.warning(f"syndication fallback: {r.status_code}")
     except Exception as e:
-        logger.warning(f"_get_twitter_image_url v1.1: {e}")
-
-    # ── Método 2: GraphQL TweetResultByRestId (varios query IDs) ───
-    # Twitter rota estos IDs; se intentan en orden hasta que uno funcione
-    graphql_query_ids = [
-        "GazOglcq_y4AELGoyhiHjA",   # activo ~2025
-        "BbCrSoXIR7z93lLCVFlQ2Q",   # alternativo conocido
-        "nBS-WpgA6ZG0CyNHD517JQ",   # otro alternativo
-        "5GOHgZe-8U2j5sVHQzEDMw",   # anterior (puede seguir activo)
-    ]
-
-    variables = _json.dumps({
-        "tweetId":               tweet_id,
-        "referrer":              "home",
-        "includePromotedContent": False,
-        "withCommunity":         False,
-        "withVoice":             False,
-    })
-    features = _json.dumps({
-        "creator_subscriptions_tweet_preview_api_enabled":                True,
-        "tweetypie_unmention_optimization_enabled":                        True,
-        "responsive_web_edit_tweet_api_enabled":                           True,
-        "graphql_is_translatable_rweb_tweet_is_translatable_enabled":     True,
-        "view_counts_everywhere_api_enabled":                              True,
-        "longform_notetweets_consumption_enabled":                         True,
-        "tweet_awards_web_tipping_enabled":                                False,
-        "freedom_of_speech_not_reach_fetch_enabled":                       True,
-        "standardized_nudges_misinfo":                                     True,
-        "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": False,
-        "interactive_text_enabled":                                        True,
-        "responsive_web_text_conversations_enabled":                       False,
-        "responsive_web_enhance_cards_enabled":                            False,
-    })
-
-    for qid in graphql_query_ids:
-        try:
-            gql_url = (
-                f"https://twitter.com/i/api/graphql/{qid}/TweetResultByRestId"
-                f"?variables={urllib.parse.quote(variables)}"
-                f"&features={urllib.parse.quote(features)}"
-            )
-            r = requests.get(gql_url, headers=headers, timeout=20,
-                             proxies=PROXIES, verify=False)
-            if r.status_code == 200:
-                data = r.json()
-                result = (data.get("data", {})
-                             .get("tweetResult", {})
-                             .get("result", {}))
-                legacy = (result.get("tweet", result)
-                               .get("legacy", {}))
-                media_list = (
-                    legacy.get("extended_entities", {}).get("media") or
-                    legacy.get("entities", {}).get("media") or []
-                )
-                text = legacy.get("full_text", "") or legacy.get("text", "")
-                fp, info = _build_info_from_media(media_list, text)
-                if fp:
-                    return fp, info
-            elif r.status_code == 404:
-                # Query ID inválido, probar el siguiente
-                continue
-            else:
-                logger.warning(f"Twitter GraphQL [{qid}]: {r.status_code}")
-        except Exception as e:
-            logger.warning(f"_get_twitter_image_url GraphQL [{qid}]: {e}")
-            continue
+        logger.warning(f"_get_twitter_image_url syndication: {e}")
 
     return None, None
 
@@ -553,9 +508,45 @@ def _download_twitter_image(url: str) -> tuple[str | None, dict | None]:
     base_info = {
         "id":            tweet_id,
         "title":         f"Tweet {tweet_id}",
+        "description":   "",
         "webpage_url":   url,
         "extractor_key": "Twitter",
     }
+
+    # ── Intento 0: fxtwitter — descarga directa de la imagen ──────────
+    # Este es el método más confiable y no requiere cookies ni auth
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "Accept":     "application/json",
+    }
+    for fx_host in ("api.fxtwitter.com", "api.vxtwitter.com"):
+        try:
+            r = requests.get(
+                f"https://{fx_host}/status/{tweet_id}",
+                headers=hdrs, timeout=20, verify=False,
+            )
+            if r.status_code == 200:
+                data   = r.json()
+                tweet  = data.get("tweet", {})
+                text   = tweet.get("text", "")
+                media  = tweet.get("media", {})
+                photos = media.get("photos") or [
+                    i for i in (media.get("all") or [])
+                    if i.get("type") in ("photo", "image")
+                ]
+                if photos:
+                    img_url = photos[0].get("url", "")
+                    if img_url:
+                        fp = _dl_image(img_url, "jpg")
+                        if fp:
+                            return fp, {
+                                **base_info,
+                                "title":       text[:100] or base_info["title"],
+                                "description": text,
+                                "ext":         "jpg",
+                            }
+        except Exception as e:
+            logger.warning(f"_download_twitter_image fxtwitter [{fx_host}]: {e}")
 
     cookies = _cookies("twitter")
 
