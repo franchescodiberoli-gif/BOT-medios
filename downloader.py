@@ -375,10 +375,118 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
                     return fp, info
     except Exception as e:
         err = str(e)
-        # Twitter: si no hay video intentar descargar imagen del tweet
-        if platform == "twitter" and "No video" in err:
+        # Twitter: si no hay video, primero intentar URL directa para Telegram
+        if platform == "twitter" and ("No video" in err or "Failed to parse JSON" in err or "403" in err):
+            fp, info = _get_twitter_image_url(url)
+            if fp:
+                return fp, info
             return _download_twitter_image(url)
         logger.error(f"download_media error: {e}")
+    return None, None
+
+
+def _get_twitter_image_url(url: str) -> tuple[str | None, dict | None]:
+    """
+    Devuelve la URL directa de la imagen del tweet (sin descargar).
+    El caller debe enviarla a Telegram directamente para que Telegram la descargue.
+    Retorna ("URL:https://...", info) cuando tiene éxito.
+    """
+    import json as _json
+    m = re.search(r"status/(\d+)", url)
+    tweet_id = m.group(1) if m else None
+    if not tweet_id:
+        return None, None
+
+    base_info = {
+        "id":            tweet_id,
+        "title":         f"Tweet {tweet_id}",
+        "webpage_url":   url,
+        "extractor_key": "Twitter",
+    }
+
+    # Parsear cookies JSON para construir cabeceras
+    raw = (os.environ.get("TWITTER_COOKIES") or "").strip()
+    auth_token, ct0 = "", ""
+    if raw.startswith("["):
+        try:
+            for c in _json.loads(raw):
+                if c.get("name") == "auth_token": auth_token = c.get("value", "")
+                if c.get("name") == "ct0":        ct0        = c.get("value", "")
+        except Exception:
+            pass
+
+    if not auth_token:
+        return None, None
+
+    headers = {
+        "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+        "x-csrf-token":  ct0,
+        "Cookie":        f"auth_token={auth_token}; ct0={ct0}",
+        "x-twitter-auth-type": "OAuth2Session",
+        "x-twitter-client-language": "en",
+        "x-twitter-active-user": "yes",
+    }
+
+    variables = _json.dumps({
+        "tweetId": tweet_id,
+        "referrer": "home",
+        "includePromotedContent": False,
+        "withCommunity": False,
+        "withVoice": False,
+    })
+    features = _json.dumps({
+        "creator_subscriptions_tweet_preview_api_enabled": True,
+        "tweetypie_unmention_optimization_enabled": True,
+        "responsive_web_edit_tweet_api_enabled": True,
+        "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+        "view_counts_everywhere_api_enabled": True,
+        "longform_notetweets_consumption_enabled": True,
+        "tweet_awards_web_tipping_enabled": False,
+        "freedom_of_speech_not_reach_fetch_enabled": True,
+        "standardized_nudges_misinfo": True,
+        "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": False,
+        "interactive_text_enabled": True,
+        "responsive_web_text_conversations_enabled": False,
+        "responsive_web_enhance_cards_enabled": False,
+    })
+
+    import urllib.parse
+    gql_url = (
+        "https://twitter.com/i/api/graphql/5GOHgZe-8U2j5sVHQzEDMw/TweetResultByRestId"
+        f"?variables={urllib.parse.quote(variables)}"
+        f"&features={urllib.parse.quote(features)}"
+    )
+
+    try:
+        r = requests.get(gql_url, headers=headers, timeout=20,
+                         proxies=PROXIES, verify=False)
+        if r.status_code == 200:
+            data = r.json()
+            # Navegar el árbol de respuesta GraphQL
+            result = (data.get("data", {})
+                         .get("tweetResult", {})
+                         .get("result", {}))
+            legacy = (result.get("tweet", result)
+                           .get("legacy", {}))
+            media_list = (legacy.get("entities", {})
+                                .get("media") or
+                          legacy.get("extended_entities", {})
+                                .get("media") or [])
+
+            photos = [md for md in media_list if md.get("type") == "photo"]
+            for photo in photos:
+                img_url = photo.get("media_url_https", "")
+                if img_url:
+                    img_url_large = img_url + "?name=large"
+                    text = legacy.get("full_text", "") or legacy.get("text", "")
+                    info = {**base_info, "title": text[:100] or base_info["title"], "ext": "jpg"}
+                    return f"URL:{img_url_large}", info
+        else:
+            logger.warning(f"Twitter GraphQL: {r.status_code}")
+    except Exception as e:
+        logger.warning(f"_get_twitter_image_url: {e}")
+
     return None, None
 
 
