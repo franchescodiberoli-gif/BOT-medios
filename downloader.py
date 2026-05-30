@@ -468,6 +468,162 @@ def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Facebook Ads Library  ──  descarga por ID de anuncio
+# ═══════════════════════════════════════════════════════════════════
+
+def _extract_fb_ad_id(url: str) -> str | None:
+    """Extrae el ID del anuncio de una URL de Facebook Ads Library."""
+    m = re.search(r"[?&]id=(\d+)", url)
+    return m.group(1) if m else None
+
+
+def _scrape_fb_ads_html(ad_id: str) -> tuple[str | None, str | None, dict | None]:
+    """
+    Hace fetch del HTML de la página de Ads Library y extrae las URLs MP4
+    directamente del JSON embebido, con todos los parámetros de autenticación.
+    Devuelve (video_hd_url, video_sd_url, snapshot_dict) o (None, None, None).
+    """
+    page_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Mode": "navigate",
+    }
+    try:
+        r = requests.get(page_url, headers=headers, timeout=30,
+                         proxies=PROXIES, verify=False)
+        if r.status_code != 200:
+            logger.warning(f"fb_ads scrape: status {r.status_code}")
+            return None, None, None
+
+        html = r.text
+
+        # Buscar video_hd_url y video_sd_url en el JSON embebido
+        hd_url = sd_url = None
+
+        # Patrón para video_hd_url con parámetros completos
+        hd_match = re.search(
+            r'"video_hd_url"\s*:\s*"(https://[^"]+\.mp4[^"]*)"',
+            html
+        )
+        if hd_match:
+            hd_url = hd_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+
+        sd_match = re.search(
+            r'"video_sd_url"\s*:\s*"(https://[^"]+\.mp4[^"]*)"',
+            html
+        )
+        if sd_match:
+            sd_url = sd_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+
+        # Extraer info básica del anuncio (página, texto del body)
+        snapshot = {}
+        page_name_m = re.search(r'"page_name"\s*:\s*"([^"]+)"', html)
+        if page_name_m:
+            snapshot["page_name"] = page_name_m.group(1)
+
+        body_m = re.search(r'"body"\s*:\s*\{\s*"text"\s*:\s*"([^"]*)"', html)
+        if body_m:
+            snapshot["body_text"] = body_m.group(1).replace("\\n", "\n")
+
+        return hd_url, sd_url, snapshot
+
+    except Exception as e:
+        logger.warning(f"_scrape_fb_ads_html: {e}")
+        return None, None, None
+
+
+def _try_fb_ads_ytdlp(ad_id: str) -> tuple[str | None, dict | None]:
+    """Intenta descargar el video con yt-dlp directamente desde la URL del anuncio."""
+    page_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
+    tmp_dir = tempfile.mkdtemp()
+    opts = {
+        "quiet":               True,
+        "no_warnings":         True,
+        "merge_output_format": "mp4",
+        "noplaylist":          True,
+        "socket_timeout":      60,
+        "nocheckcertificate":  True,
+        "format":              "best[height<=720]/best",
+        "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+    }
+    if PROXY:
+        opts["proxy"] = PROXY
+    try:
+        logger.info(f"→ yt-dlp fb_ads [{ad_id}]...")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(page_url, download=True)
+            for f in os.listdir(tmp_dir):
+                fp = os.path.join(tmp_dir, f)
+                if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
+                    return fp, info
+    except Exception as e:
+        logger.warning(f"_try_fb_ads_ytdlp: {e}")
+    return None, None
+
+
+def download_facebook_ads(url: str) -> tuple[str | None, dict | None]:
+    """
+    Descarga el video de un anuncio de Facebook Ads Library.
+    Orden de intentos:
+      1. Scraping HTML → URL directa con parámetros de auth completos
+      2. yt-dlp directo en la URL del anuncio
+      3. Cobalt (fallback genérico)
+    """
+    ad_id = _extract_fb_ad_id(url)
+    if not ad_id:
+        logger.warning(f"download_facebook_ads: no se pudo extraer ID de {url}")
+        return None, None
+
+    base_info = {
+        "id":            ad_id,
+        "title":         f"Anuncio Facebook #{ad_id}",
+        "description":   "",
+        "webpage_url":   f"https://www.facebook.com/ads/library/?id={ad_id}",
+        "extractor_key": "FacebookAds",
+    }
+
+    # ── Intento 1: Scraping HTML ──────────────────────────────────
+    logger.info(f"→ fb_ads scraping HTML para ID {ad_id}...")
+    hd_url, sd_url, snapshot = _scrape_fb_ads_html(ad_id)
+
+    video_url = hd_url or sd_url
+    if video_url:
+        logger.info(f"fb_ads: URL extraída del HTML → {video_url[:80]}...")
+        fp = _download_direct_url(video_url, "mp4")
+        if fp:
+            if snapshot:
+                base_info["title"]       = f"Anuncio de {snapshot.get('page_name', 'Facebook')} #{ad_id}"
+                base_info["description"] = snapshot.get("body_text", "")
+                base_info["page_name"]   = snapshot.get("page_name", "")
+            return fp, base_info
+
+    # ── Intento 2: yt-dlp ────────────────────────────────────────
+    logger.info(f"→ fb_ads yt-dlp para ID {ad_id}...")
+    fp, info = _try_fb_ads_ytdlp(ad_id)
+    if fp:
+        if info:
+            info.setdefault("extractor_key", "FacebookAds")
+        return fp, info or base_info
+
+    # ── Intento 3: Cobalt ────────────────────────────────────────
+    logger.info(f"→ fb_ads cobalt para ID {ad_id}...")
+    lib_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
+    fp, cobalt_info = _try_cobalt(lib_url)
+    if fp:
+        return fp, cobalt_info or base_info
+
+    logger.error(f"download_facebook_ads: todos los métodos fallaron para {ad_id}")
+    return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Descargador genérico
 # ═══════════════════════════════════════════════════════════════════
 
@@ -478,6 +634,10 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
 
     if platform in ("youtube_short", "youtube_long"):
         return download_youtube(url, platform)
+
+    # Facebook Ads Library: flujo especial por scraping + yt-dlp
+    if platform == "facebook_ads" or "facebook.com/ads/library" in url:
+        return download_facebook_ads(url)
 
     # Twitter/X: usa fxtwitter primero (evita bloqueos de API)
     if platform == "twitter" or "x.com" in url or "twitter.com" in url:
