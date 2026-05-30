@@ -130,11 +130,31 @@ def format_redgif_in_reddit(info: dict, redgif_url: str) -> str:
     return msg.strip()
 
 
+def format_facebook_ads(info: dict, clean_url: str) -> str:
+    ad_id     = info.get("id", "")
+    page_name = info.get("page_name", "") or info.get("uploader", "")
+    body_text = info.get("description", "") or info.get("title", "")
+    hashtags  = clean_hashtags(body_text)
+    body      = body_text.replace(hashtags, "").strip()
+
+    msg = f"📢 *Facebook Ads Library*\n\n"
+    if page_name:
+        msg += f"👤 *Anunciante:* {page_name}\n"
+    msg += f"🆔 *ID del anuncio:* `{ad_id}`\n"
+    msg += f"🔗 [Ver anuncio]({clean_url})\n\n"
+    if body:
+        msg += f"📝 *Texto del anuncio:*\n{body}\n\n"
+    if hashtags:
+        msg += f"*#️⃣ Hashtags:*\n{hashtags}"
+    return msg.strip()
+
+
 def format_message(platform: str, info: dict, clean_url: str) -> str:
     formatters = {
         "instagram":        format_instagram,
         "tiktok":           format_tiktok,
         "facebook":         format_facebook,
+        "facebook_ads":     format_facebook_ads,
         "youtube_short":    format_youtube_short,
         "youtube_long":     format_youtube_long,
         "reddit":           format_reddit,
