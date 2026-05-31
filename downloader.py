@@ -699,49 +699,42 @@ def _ensure_playwright():
     if _PW_INSTALLED:
         return
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            p.chromium.launch(headless=True)   # rápido si ya está instalado
+        # Verificar si Chromium ya está instalado intentando encontrar el ejecutable
+        from playwright.sync_api import sync_playwright as _sp
+        with _sp() as _p:
+            _p.chromium.executable_path  # lanza excepción si no está
         _PW_INSTALLED = True
     except Exception:
-        logger.info("fb_ads: instalando Chromium para Playwright...")
-        os.system("playwright install chromium --with-deps 2>&1 | tail -5")
+        logger.info("fb_ads: instalando Chromium (sin --with-deps)...")
+        ret = os.system("playwright install chromium 2>&1")
+        logger.info(f"fb_ads: playwright install terminó con código {ret}")
         _PW_INSTALLED = True
 
 
-def _scrape_fb_ads_playwright(ad_id: str, cookies: dict) -> dict | None:
+def _playwright_worker(ad_id: str, cookies: dict) -> dict | None:
     """
-    Abre la página del anuncio con Playwright (Chromium headless).
-    Al ser un navegador real resuelve el JS-challenge que bloquea a requests.
-    Captura URLs de video/imagen interceptando las peticiones de red (Network),
-    igual que lo hace el usuario a mano con F12 → Network.
+    Ejecuta el scraping con Playwright Async API dentro de su propio event loop.
+    Debe llamarse desde un hilo (ThreadPoolExecutor), nunca desde el loop de asyncio.
     """
-    _ensure_playwright()
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        logger.warning("fb_ads playwright: playwright no instalado")
-        return None
+    import asyncio
+    from playwright.async_api import async_playwright
 
-    page_url = (
-        f"https://www.facebook.com/ads/library/"
-        f"?active_status=active&ad_type=all&country=ALL&id={ad_id}"
-    )
+    async def _run():
+        videos, images, snapshot = [], [], {}
+        page_url = (
+            f"https://www.facebook.com/ads/library/"
+            f"?active_status=active&ad_type=all&country=ALL&id={ad_id}"
+        )
 
-    videos, images = [], []
+        def _on_response(response):
+            url = response.url
+            if "fbcdn.net" in url and ".mp4" in url:
+                videos.append(url)
+            elif ("fbcdn.net" in url or "scontent" in url) and \
+                 any(e in url for e in (".jpg", ".jpeg", ".png", ".webp")):
+                images.append(url)
 
-    def _on_response(response):
-        url = response.url
-        # Videos: fbcdn mp4
-        if "fbcdn.net" in url and ".mp4" in url:
-            videos.append(url)
-        # Imágenes: fbcdn jpeg/jpg/png/webp
-        elif ("fbcdn.net" in url or "scontent" in url) and \
-             any(ext in url for ext in (".jpg", ".jpeg", ".png", ".webp")):
-            images.append(url)
-
-    try:
-        with sync_playwright() as p:
+        async with async_playwright() as p:
             launch_opts = {
                 "headless": True,
                 "args": [
@@ -754,74 +747,68 @@ def _scrape_fb_ads_playwright(ad_id: str, cookies: dict) -> dict | None:
             if fb_proxy:
                 launch_opts["proxy"] = {"server": fb_proxy}
 
-            browser = p.chromium.launch(**launch_opts)
-            ctx = browser.new_context(
+            browser = await p.chromium.launch(**launch_opts)
+            ctx = await browser.new_context(
                 user_agent=_fb_headers()["User-Agent"],
                 locale="es-MX",
                 viewport={"width": 1280, "height": 800},
             )
-
-            # Cargar cookies de Facebook
             if cookies:
-                ctx.add_cookies([
-                    {
-                        "name":   name,
-                        "value":  value,
-                        "domain": ".facebook.com",
-                        "path":   "/",
-                    }
-                    for name, value in cookies.items()
+                await ctx.add_cookies([
+                    {"name": k, "value": v, "domain": ".facebook.com", "path": "/"}
+                    for k, v in cookies.items()
                 ])
 
-            page = ctx.new_page()
+            page = await ctx.new_page()
             page.on("response", _on_response)
 
-            logger.info(f"fb_ads playwright: abriendo {page_url[:80]}...")
-            page.goto(page_url, wait_until="networkidle", timeout=45_000)
+            logger.info(f"fb_ads playwright: navegando a {page_url[:80]}...")
+            await page.goto(page_url, wait_until="networkidle", timeout=45_000)
+            await page.wait_for_timeout(3_000)
 
-            # Dar tiempo extra al carrusel si es necesario
-            page.wait_for_timeout(3_000)
+            html = await page.content()
+            await browser.close()
 
-            # También extraer del HTML renderizado (respaldo)
-            html = page.content()
-            for pat in (r'"video_hd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"',
-                        r'"video_sd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"'):
-                for m in re.findall(pat, html):
-                    videos.append(_fb_unescape(m))
-
-            originals = [_fb_unescape(m) for m in
-                         re.findall(r'"original_image_url"\s*:\s*"(https:[^"]+?)"', html)]
-            resized   = [_fb_unescape(m) for m in
-                         re.findall(r'"resized_image_url"\s*:\s*"(https:[^"]+?)"', html)]
-            for u in (originals or resized):
-                if ".mp4" not in u:
-                    images.append(u)
-
-            # Metadatos
-            snapshot = {}
-            m = re.search(r'"page_name"\s*:\s*"([^"]+)"', html)
-            if m:
-                snapshot["page_name"] = _fb_unescape(m.group(1))
-            m = re.search(r'"body"\s*:\s*\{\s*"text"\s*:\s*"([^"]*)"', html)
-            if m:
-                snapshot["body_text"] = _fb_unescape(m.group(1)).replace("\\n", "\n")
-
-            browser.close()
+        # Extraer también del HTML renderizado
+        for pat in (r'"video_hd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"',
+                    r'"video_sd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"'):
+            for m in re.findall(pat, html):
+                videos.append(_fb_unescape(m))
+        originals = [_fb_unescape(m) for m in
+                     re.findall(r'"original_image_url"\s*:\s*"(https:[^"]+?)"', html)]
+        resized   = [_fb_unescape(m) for m in
+                     re.findall(r'"resized_image_url"\s*:\s*"(https:[^"]+?)"', html)]
+        for u in (originals or resized):
+            if ".mp4" not in u:
+                images.append(u)
+        m = re.search(r'"page_name"\s*:\s*"([^"]+)"', html)
+        if m:
+            snapshot["page_name"] = _fb_unescape(m.group(1))
 
         videos = list(dict.fromkeys(videos))
         images = list(dict.fromkeys(images))
-
         if not videos and not images:
-            logger.warning("fb_ads playwright: página cargó pero sin media")
             return None
-
         logger.info(f"fb_ads playwright: {len(videos)} video(s), {len(images)} imagen(es)")
         return {"videos": videos, "images": images, "snapshot": snapshot}
 
+    return asyncio.run(_run())
+
+
+def _scrape_fb_ads_playwright(ad_id: str, cookies: dict) -> dict | None:
+    """
+    Lanza _playwright_worker en un hilo dedicado para evitar el conflicto
+    'Sync API inside asyncio loop' que ocurre cuando el bot ya tiene un loop activo.
+    """
+    _ensure_playwright()
+    import concurrent.futures
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_playwright_worker, ad_id, cookies)
+            return future.result(timeout=90)
     except Exception as e:
         logger.warning(f"_scrape_fb_ads_playwright: {e}")
         return None
-
 def _try_fb_ads_ytdlp(ad_id: str, cookies: str | None) -> tuple[str | None, dict | None]:
     """Fallback: intenta descargar el video con yt-dlp (solo sirve para video)."""
     page_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
