@@ -622,7 +622,7 @@ def _fb_download(cookies: dict, url: str, ext: str = "mp4") -> str | None:
                 with open(tmp, "wb") as f:
                     for chunk in r.iter_content(chunk_size=256 * 1024):
                         f.write(chunk)
-        min_size = 10_000 if ext == "mp4" else 1_000
+        min_size = 10_000   # 10 KB mínimo para video e imagen
         if os.path.getsize(tmp) > min_size:
             return tmp
     except Exception as e:
@@ -721,6 +721,7 @@ def _playwright_worker(ad_id: str, cookies: dict) -> dict | None:
 
     async def _run():
         videos, images, snapshot = [], [], {}
+        net_videos = []
         page_url = (
             f"https://www.facebook.com/ads/library/"
             f"?active_status=active&ad_type=all&country=ALL&id={ad_id}"
@@ -728,11 +729,9 @@ def _playwright_worker(ad_id: str, cookies: dict) -> dict | None:
 
         def _on_response(response):
             url = response.url
+            # Solo capturar videos de la red; las imágenes las extraemos del HTML
             if "fbcdn.net" in url and ".mp4" in url:
-                videos.append(url)
-            elif ("fbcdn.net" in url or "scontent" in url) and \
-                 any(e in url for e in (".jpg", ".jpeg", ".png", ".webp")):
-                images.append(url)
+                net_videos.append(url)
 
         async with async_playwright() as p:
             launch_opts = {
@@ -769,25 +768,29 @@ def _playwright_worker(ad_id: str, cookies: dict) -> dict | None:
             html = await page.content()
             await browser.close()
 
-        # Extraer también del HTML renderizado
+        # Extraer del HTML renderizado (específico del anuncio, no UI)
         for pat in (r'"video_hd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"',
                     r'"video_sd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"'):
             for m in re.findall(pat, html):
                 videos.append(_fb_unescape(m))
+        # Si HTML no dio videos, usar los capturados de la red como respaldo
+        if not videos:
+            videos = net_videos
+
         originals = [_fb_unescape(m) for m in
                      re.findall(r'"original_image_url"\s*:\s*"(https:[^"]+?)"', html)]
         resized   = [_fb_unescape(m) for m in
                      re.findall(r'"resized_image_url"\s*:\s*"(https:[^"]+?)"', html)]
-        for u in (originals or resized):
-            if ".mp4" not in u:
-                images.append(u)
-        m = re.search(r'"page_name"\s*:\s*"([^"]+)"', html)
-        if m:
-            snapshot["page_name"] = _fb_unescape(m.group(1))
+        images = [u for u in (originals or resized) if ".mp4" not in u]
+
+        meta = re.search(r'"page_name"\s*:\s*"([^"]+)"', html)
+        if meta:
+            snapshot["page_name"] = _fb_unescape(meta.group(1))
 
         videos = list(dict.fromkeys(videos))
         images = list(dict.fromkeys(images))
         if not videos and not images:
+            logger.warning("fb_ads playwright: página cargó pero sin media en el JSON")
             return None
         logger.info(f"fb_ads playwright: {len(videos)} video(s), {len(images)} imagen(es)")
         return {"videos": videos, "images": images, "snapshot": snapshot}
