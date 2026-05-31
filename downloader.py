@@ -691,6 +691,137 @@ def _scrape_fb_ads_html(ad_id: str, cookies: dict) -> dict | None:
         return None
 
 
+# ── Instala Chromium una sola vez si no está ──────────────────────────────────
+_PW_INSTALLED = False
+
+def _ensure_playwright():
+    global _PW_INSTALLED
+    if _PW_INSTALLED:
+        return
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            p.chromium.launch(headless=True)   # rápido si ya está instalado
+        _PW_INSTALLED = True
+    except Exception:
+        logger.info("fb_ads: instalando Chromium para Playwright...")
+        os.system("playwright install chromium --with-deps 2>&1 | tail -5")
+        _PW_INSTALLED = True
+
+
+def _scrape_fb_ads_playwright(ad_id: str, cookies: dict) -> dict | None:
+    """
+    Abre la página del anuncio con Playwright (Chromium headless).
+    Al ser un navegador real resuelve el JS-challenge que bloquea a requests.
+    Captura URLs de video/imagen interceptando las peticiones de red (Network),
+    igual que lo hace el usuario a mano con F12 → Network.
+    """
+    _ensure_playwright()
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.warning("fb_ads playwright: playwright no instalado")
+        return None
+
+    page_url = (
+        f"https://www.facebook.com/ads/library/"
+        f"?active_status=active&ad_type=all&country=ALL&id={ad_id}"
+    )
+
+    videos, images = [], []
+
+    def _on_response(response):
+        url = response.url
+        # Videos: fbcdn mp4
+        if "fbcdn.net" in url and ".mp4" in url:
+            videos.append(url)
+        # Imágenes: fbcdn jpeg/jpg/png/webp
+        elif ("fbcdn.net" in url or "scontent" in url) and \
+             any(ext in url for ext in (".jpg", ".jpeg", ".png", ".webp")):
+            images.append(url)
+
+    try:
+        with sync_playwright() as p:
+            launch_opts = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            }
+            fb_proxy = _fb_proxy()
+            if fb_proxy:
+                launch_opts["proxy"] = {"server": fb_proxy}
+
+            browser = p.chromium.launch(**launch_opts)
+            ctx = browser.new_context(
+                user_agent=_fb_headers()["User-Agent"],
+                locale="es-MX",
+                viewport={"width": 1280, "height": 800},
+            )
+
+            # Cargar cookies de Facebook
+            if cookies:
+                ctx.add_cookies([
+                    {
+                        "name":   name,
+                        "value":  value,
+                        "domain": ".facebook.com",
+                        "path":   "/",
+                    }
+                    for name, value in cookies.items()
+                ])
+
+            page = ctx.new_page()
+            page.on("response", _on_response)
+
+            logger.info(f"fb_ads playwright: abriendo {page_url[:80]}...")
+            page.goto(page_url, wait_until="networkidle", timeout=45_000)
+
+            # Dar tiempo extra al carrusel si es necesario
+            page.wait_for_timeout(3_000)
+
+            # También extraer del HTML renderizado (respaldo)
+            html = page.content()
+            for pat in (r'"video_hd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"',
+                        r'"video_sd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"'):
+                for m in re.findall(pat, html):
+                    videos.append(_fb_unescape(m))
+
+            originals = [_fb_unescape(m) for m in
+                         re.findall(r'"original_image_url"\s*:\s*"(https:[^"]+?)"', html)]
+            resized   = [_fb_unescape(m) for m in
+                         re.findall(r'"resized_image_url"\s*:\s*"(https:[^"]+?)"', html)]
+            for u in (originals or resized):
+                if ".mp4" not in u:
+                    images.append(u)
+
+            # Metadatos
+            snapshot = {}
+            m = re.search(r'"page_name"\s*:\s*"([^"]+)"', html)
+            if m:
+                snapshot["page_name"] = _fb_unescape(m.group(1))
+            m = re.search(r'"body"\s*:\s*\{\s*"text"\s*:\s*"([^"]*)"', html)
+            if m:
+                snapshot["body_text"] = _fb_unescape(m.group(1)).replace("\\n", "\n")
+
+            browser.close()
+
+        videos = list(dict.fromkeys(videos))
+        images = list(dict.fromkeys(images))
+
+        if not videos and not images:
+            logger.warning("fb_ads playwright: página cargó pero sin media")
+            return None
+
+        logger.info(f"fb_ads playwright: {len(videos)} video(s), {len(images)} imagen(es)")
+        return {"videos": videos, "images": images, "snapshot": snapshot}
+
+    except Exception as e:
+        logger.warning(f"_scrape_fb_ads_playwright: {e}")
+        return None
+
 def _try_fb_ads_ytdlp(ad_id: str, cookies: str | None) -> tuple[str | None, dict | None]:
     """Fallback: intenta descargar el video con yt-dlp (solo sirve para video)."""
     page_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
@@ -751,9 +882,14 @@ def download_facebook_ads(url: str) -> tuple[str | list[str] | None, dict | None
 
     cookies, cookies_path = _fb_session()
 
-    # ── Intento 1: Scraping HTML (video + imágenes) ───────────────────
+    # ── Intento 1: Scraping HTML con curl_cffi ────────────────────────
     logger.info(f"→ fb_ads scraping HTML para ID {ad_id}...")
     scraped = _scrape_fb_ads_html(ad_id, cookies)
+
+    # ── Intento 2: Playwright (navegador real, resuelve JS challenge) ──
+    if not scraped:
+        logger.info(f"→ fb_ads Playwright para ID {ad_id}...")
+        scraped = _scrape_fb_ads_playwright(ad_id, cookies)
 
     if scraped:
         snap = scraped.get("snapshot", {})
