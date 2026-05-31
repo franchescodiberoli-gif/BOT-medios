@@ -493,6 +493,25 @@ except Exception:
 
 FB_IMPERSONATE = os.environ.get("FB_IMPERSONATE", "chrome124")
 
+# Proxy dedicado para Facebook. Tiene prioridad sobre PROXY_URL global.
+#   - Una URL de proxy  → se usa esa (ideal: residencial de México)
+#   - "direct"/"none"   → conexión directa, SIN proxy (IP nativa de Streamlit)
+#   - vacío             → usa PROXY_URL global (comportamiento anterior)
+FB_PROXY_URL = os.environ.get("FB_PROXY_URL", "").strip()
+
+
+def _fb_proxy() -> str:
+    if FB_PROXY_URL:
+        if FB_PROXY_URL.lower() in ("direct", "none", "off"):
+            return ""
+        return FB_PROXY_URL
+    return PROXY
+
+
+def _fb_proxies_dict() -> dict:
+    p = _fb_proxy()
+    return {"http": p, "https": p} if p else {}
+
 
 def _fb_cookie_dict() -> dict:
     """Lee el archivo de cookies de Facebook (Netscape) a un dict {nombre: valor}."""
@@ -523,15 +542,16 @@ def _fb_get(url: str, cookies: dict, headers: dict, timeout: int = 30):
         }
         if cookies:
             kw["cookies"] = cookies
-        if PROXY:
-            kw["proxies"] = {"http": PROXY, "https": PROXY}
+        proxies = _fb_proxies_dict()
+        if proxies:
+            kw["proxies"] = proxies
         return cffi_requests.get(url, **kw)
     # Fallback: requests normal (más propenso al 403)
     sess = requests.Session()
     if cookies:
         sess.cookies.update(cookies)
     return sess.get(url, headers=headers, timeout=timeout,
-                    proxies=PROXIES, verify=False)
+                    proxies=_fb_proxies_dict(), verify=False)
 
 
 def _fb_session() -> tuple[dict, str | None]:
@@ -585,8 +605,9 @@ def _fb_download(cookies: dict, url: str, ext: str = "mp4") -> str | None:
             kw = {"headers": hdrs, "timeout": 120, "impersonate": FB_IMPERSONATE, "verify": False}
             if cookies:
                 kw["cookies"] = cookies
-            if PROXY:
-                kw["proxies"] = {"http": PROXY, "https": PROXY}
+            proxies = _fb_proxies_dict()
+            if proxies:
+                kw["proxies"] = proxies
             r = cffi_requests.get(url, **kw)
             r.raise_for_status()
             with open(tmp, "wb") as f:
@@ -596,7 +617,7 @@ def _fb_download(cookies: dict, url: str, ext: str = "mp4") -> str | None:
             if cookies:
                 sess.cookies.update(cookies)
             with sess.get(url, headers=hdrs, stream=True, timeout=120,
-                          proxies=PROXIES, verify=False) as r:
+                          proxies=_fb_proxies_dict(), verify=False) as r:
                 r.raise_for_status()
                 with open(tmp, "wb") as f:
                     for chunk in r.iter_content(chunk_size=256 * 1024):
@@ -615,11 +636,17 @@ def _scrape_fb_ads_html(ad_id: str, cookies: dict) -> dict | None:
     URLs de video e imagen disponibles, además de metadatos básicos.
     Devuelve un dict {videos: [...], images: [...], snapshot: {...}} o None.
     """
-    page_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
+    page_url = (
+        f"https://www.facebook.com/ads/library/"
+        f"?active_status=active&ad_type=all&country=ALL&id={ad_id}"
+    )
     try:
         r = _fb_get(page_url, cookies, _fb_headers(), timeout=30)
         if r.status_code != 200:
-            logger.warning(f"fb_ads scrape: status {r.status_code}")
+            via = _fb_proxy() or "directo (sin proxy)"
+            snippet = (r.text or "")[:400].replace("\n", " ").replace("\r", " ")
+            logger.warning(f"fb_ads scrape: status {r.status_code} | vía {via}")
+            logger.warning(f"fb_ads 403 body[:400]: {snippet}")
             return None
         html = r.text
 
