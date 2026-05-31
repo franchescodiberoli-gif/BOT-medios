@@ -692,23 +692,18 @@ def _scrape_fb_ads_html(ad_id: str, cookies: dict) -> dict | None:
 
 
 # ── Instala Chromium una sola vez si no está ──────────────────────────────────
-_PW_INSTALLED = False
-
 def _ensure_playwright():
-    global _PW_INSTALLED
-    if _PW_INSTALLED:
-        return
-    try:
-        # Verificar si Chromium ya está instalado intentando encontrar el ejecutable
-        from playwright.sync_api import sync_playwright as _sp
-        with _sp() as _p:
-            _p.chromium.executable_path  # lanza excepción si no está
-        _PW_INSTALLED = True
-    except Exception:
-        logger.info("fb_ads: instalando Chromium (sin --with-deps)...")
-        ret = os.system("playwright install chromium 2>&1")
-        logger.info(f"fb_ads: playwright install terminó con código {ret}")
-        _PW_INSTALLED = True
+    """Instala Chromium si no existe en disco. Solo se ejecuta una vez por container."""
+    import glob, pathlib
+    # Verificar si ya existe el ejecutable en disco (persiste durante la sesión)
+    cache = pathlib.Path.home() / ".cache" / "ms-playwright"
+    shells = list(cache.glob("chromium*/chrome-headless-shell-linux64/chrome-headless-shell"))
+    chromes = list(cache.glob("chromium*/chrome-linux64/chrome"))
+    if shells or chromes:
+        return   # Ya instalado, no re-descargar
+    logger.info("fb_ads: instalando Chromium (sin --with-deps)...")
+    ret = os.system("playwright install chromium 2>&1")
+    logger.info(f"fb_ads: playwright install terminó con código {ret}")
 
 
 def _playwright_worker(ad_id: str, cookies: dict) -> dict | None:
@@ -777,18 +772,40 @@ def _playwright_worker(ad_id: str, cookies: dict) -> dict | None:
         if not videos:
             videos = net_videos
 
-        originals = [_fb_unescape(m) for m in
-                     re.findall(r'"original_image_url"\s*:\s*"(https:[^"]+?)"', html)]
-        resized   = [_fb_unescape(m) for m in
-                     re.findall(r'"resized_image_url"\s*:\s*"(https:[^"]+?)"', html)]
-        images = [u for u in (originals or resized) if ".mp4" not in u]
+        # ── Extraer SOLO del bloque JSON del anuncio específico ──────────────
+        # La página muestra TODOS los anuncios del anunciante; usamos el ad_id
+        # para encontrar el bloque JSON de este anuncio específico y extraer
+        # solo su imagen/video, no los de todos los demás.
+        def _extract_for_ad(html: str, ad_id: str):
+            vid, img = [], []
+            # Encontrar posición del ad_id en el HTML y tomar ventana de 8000 chars
+            pos = html.find(f'"{ad_id}"')
+            if pos == -1:
+                pos = html.find(ad_id)
+            if pos != -1:
+                window = html[max(0, pos - 500): pos + 8000]
+            else:
+                window = html   # fallback: buscar en todo el HTML
+
+            for pat in (r'"video_hd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"',
+                        r'"video_sd_url"\s*:\s*"(https:[^"]+?\.mp4[^"]*)"'):
+                for m in re.findall(pat, window):
+                    vid.append(_fb_unescape(m))
+            originals = [_fb_unescape(m) for m in
+                         re.findall(r'"original_image_url"\s*:\s*"(https:[^"]+?)"', window)]
+            resized   = [_fb_unescape(m) for m in
+                         re.findall(r'"resized_image_url"\s*:\s*"(https:[^"]+?)"', window)]
+            img = [u for u in (originals or resized) if ".mp4" not in u]
+            return list(dict.fromkeys(vid)), list(dict.fromkeys(img))
+
+        videos, images = _extract_for_ad(html, ad_id)
+        if not videos:
+            videos = list(dict.fromkeys(net_videos))
 
         meta = re.search(r'"page_name"\s*:\s*"([^"]+)"', html)
         if meta:
             snapshot["page_name"] = _fb_unescape(meta.group(1))
 
-        videos = list(dict.fromkeys(videos))
-        images = list(dict.fromkeys(images))
         if not videos and not images:
             logger.warning("fb_ads playwright: página cargó pero sin media en el JSON")
             return None
@@ -812,6 +829,7 @@ def _scrape_fb_ads_playwright(ad_id: str, cookies: dict) -> dict | None:
     except Exception as e:
         logger.warning(f"_scrape_fb_ads_playwright: {e}")
         return None
+
 def _try_fb_ads_ytdlp(ad_id: str, cookies: str | None) -> tuple[str | None, dict | None]:
     """Fallback: intenta descargar el video con yt-dlp (solo sirve para video)."""
     page_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
