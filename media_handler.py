@@ -22,6 +22,9 @@ SHORT_MAX_SECONDS = 60
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
+# YouTube y TikTok: además del video, extraer y enviar también el audio.
+AUDIO_PLATFORMS = ("youtube_short", "youtube_long", "tiktok")
+
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
@@ -119,6 +122,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update, file_path, ext, file_size_mb, caption_text,
             width=width, height=height, duration=duration,
         )
+
+        # YouTube y TikTok: además del video, enviar también el audio extraído.
+        if platform in AUDIO_PLATFORMS and ext not in IMAGE_EXTS and ext != ".gif":
+            await _send_audio(update, file_path, info)
 
     except Exception as e:
         logger.error(f"Error procesando {url}: {e}")
@@ -330,6 +337,51 @@ async def _send_single_file(update, file_path: str, ext: str, size_mb: float, ca
 
     if overflow:
         await _send_long_text(update, overflow)
+
+
+def _extract_audio(video_path: str) -> str | None:
+    """Extrae la pista de audio de un video a un .mp3 con ffmpeg.
+    Devuelve la ruta del .mp3, o None si el video no tiene audio o ffmpeg falla."""
+    audio_path = os.path.splitext(video_path)[0] + ".mp3"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-i", video_path, "-vn", "-acodec", "libmp3lame", "-q:a", "2",
+             audio_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+            return audio_path
+    except Exception as e:
+        logger.warning(f"_extract_audio: {e}")
+    return None
+
+
+async def _send_audio(update, video_path: str, info: dict):
+    """Extrae el audio del video ya descargado y lo envía como archivo de audio.
+    Silencioso ante fallos: el video ya se envió, el audio es solo un extra."""
+    audio_path = _extract_audio(video_path)
+    if not audio_path:
+        return
+    try:
+        size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+        if size_mb > MAX_FILE_SIZE_MB:
+            logger.info(f"_send_audio: audio {size_mb:.1f}MB > {MAX_FILE_SIZE_MB}MB, omitido")
+            return
+        await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        kwargs = {"title": (info.get("title") or "audio").strip()[:64]}
+        performer = (info.get("uploader") or info.get("channel") or "").strip()[:64]
+        if performer:
+            kwargs["performer"] = performer
+        duration = int(info.get("duration") or 0)
+        if duration:
+            kwargs["duration"] = duration
+        with open(audio_path, "rb") as f:
+            await update.message.reply_audio(audio=f, **kwargs)
+    except Exception as e:
+        logger.warning(f"_send_audio: {e}")
+    finally:
+        _cleanup(audio_path)
 
 
 def _ffprobe(file_path: str):
