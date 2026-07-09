@@ -28,6 +28,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      # yt-dlp (desde 2025.11) necesita un runtime de JS para resolver el
+      # challenge de firmas de YouTube; sin esto no hay URLs de formatos.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Verificar secret del bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -48,7 +54,7 @@ jobs:
       - name: Instalar dependencias
         run: |
           pip install -U -r requirements.txt
-          pip install -U yt-dlp bgutil-ytdlp-pot-provider
+          pip install -U "yt-dlp[default]" bgutil-ytdlp-pot-provider
           # Chromium para el fallback de Facebook Ads (si no, se re-descargan
           # ~170MB en runtime la primera vez que alguien manda un anuncio)
           python -m playwright install chromium
