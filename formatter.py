@@ -1,10 +1,19 @@
+import re
+
 from downloader import clean_hashtags
+
+
+def _sin_hashtags(text: str) -> str:
+    """Quita los hashtags del texto (uno por uno; no estaban contiguos,
+    así que un replace del bloque completo nunca los quitaba)."""
+    body = re.sub(r"#\w+", "", text or "")
+    return re.sub(r"[ \t]{2,}", " ", body).strip()
 
 
 def format_instagram(info: dict, clean_url: str) -> str:
     caption = info.get("description", "") or ""
     hashtags = clean_hashtags(caption)
-    body = caption.replace(hashtags, "").strip()
+    body = _sin_hashtags(caption)
     msg = f"📸 *Instagram*\n\n🔗 [Ver contenido]({clean_url})\n\n"
     if body:
         msg += f"📝 *Caption:*\n{body}\n\n"
@@ -16,7 +25,7 @@ def format_instagram(info: dict, clean_url: str) -> str:
 def format_tiktok(info: dict, clean_url: str) -> str:
     caption = info.get("description", "") or ""
     hashtags = clean_hashtags(caption)
-    body = caption.replace(hashtags, "").strip()
+    body = _sin_hashtags(caption)
     msg = f"🎵 *TikTok*\n\n🔗 [Ver contenido]({clean_url})\n\n"
     if body:
         msg += f"📝 *Caption:*\n{body}\n\n"
@@ -28,7 +37,7 @@ def format_tiktok(info: dict, clean_url: str) -> str:
 def format_facebook(info: dict, clean_url: str) -> str:
     caption = info.get("description", "") or info.get("title", "") or ""
     hashtags = clean_hashtags(caption)
-    body = caption.replace(hashtags, "").strip()
+    body = _sin_hashtags(caption)
     msg = f"📘 *Facebook*\n\n🔗 [Ver contenido]({clean_url})\n\n"
     if body:
         msg += f"📝 *Caption:*\n{body}\n\n"
@@ -40,7 +49,7 @@ def format_facebook(info: dict, clean_url: str) -> str:
 def format_youtube_short(info: dict, clean_url: str) -> str:
     caption = info.get("description", "") or ""
     hashtags = clean_hashtags(caption)
-    body = caption.replace(hashtags, "").strip()
+    body = _sin_hashtags(caption)
     msg = f"▶️ *YouTube Short*\n\n🔗 [Ver contenido]({clean_url})\n\n"
     if body:
         msg += f"📝 *Caption:*\n{body}\n\n"
@@ -77,7 +86,7 @@ def format_reddit(info: dict, clean_url: str) -> str:
 def format_twitter(info: dict, clean_url: str) -> str:
     caption = info.get("description", "") or info.get("title", "") or ""
     hashtags = clean_hashtags(caption)
-    body = caption.replace(hashtags, "").strip()
+    body = _sin_hashtags(caption)
     msg = f"🐦 *Twitter / X*\n\n🔗 [Ver tweet]({clean_url})\n\n"
     if body:
         msg += f"📝 *Tweet:*\n{body}\n\n"
@@ -89,7 +98,7 @@ def format_twitter(info: dict, clean_url: str) -> str:
 def format_threads(info: dict, clean_url: str) -> str:
     caption = info.get("description", "") or ""
     hashtags = clean_hashtags(caption)
-    body = caption.replace(hashtags, "").strip()
+    body = _sin_hashtags(caption)
     msg = f"🧵 *Threads*\n\n🔗 [Ver post]({clean_url})\n\n"
     if body:
         msg += f"📝 *Caption:*\n{body}\n\n"
@@ -135,7 +144,7 @@ def format_facebook_ads(info: dict, clean_url: str) -> str:
     page_name = info.get("page_name", "") or info.get("uploader", "")
     body_text = info.get("description", "") or info.get("title", "")
     hashtags  = clean_hashtags(body_text)
-    body      = body_text.replace(hashtags, "").strip()
+    body      = _sin_hashtags(body_text)
 
     msg = f"📢 *Facebook Ads Library*\n\n"
     if page_name:

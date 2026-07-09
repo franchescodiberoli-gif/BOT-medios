@@ -1,0 +1,82 @@
+name: MediaBot
+
+# El bot corre 5.5 horas por corrida (límite de GitHub: 6 h por job) y al
+# terminar se relanza solo → queda "siempre encendido" con huecos de ~1-2 min.
+# El cron cada 6 h es respaldo por si la cadena se corta (crash, mantenimiento).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  actions: write
+
+# Nunca dos bots a la vez: Telegram da error 409 si hay dos polling del mismo
+# token. Una corrida nueva espera en cola a que termine la actual.
+concurrency:
+  group: mediabot
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verificar secret del bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "::error::Falta el secret TELEGRAM_BOT_TOKEN (Settings → Secrets and variables → Actions)"
+            exit 1
+          fi
+
+      - name: Servidor de PO Tokens para YouTube
+        run: |
+          docker run -d --init --name bgutil-provider -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          # Esperar a que el servidor responda (máx 60s); si no, el bot igual
+          # arranca — los clientes tv/web_embedded funcionan sin PO Token.
+          timeout 60 bash -c 'until curl -sf http://127.0.0.1:4416/ping > /dev/null; do sleep 2; done' \
+            && echo "Servidor POT listo" || echo "::warning::Servidor POT no respondió; YouTube usará solo tv/web_embedded"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -U -r requirements.txt
+          pip install -U yt-dlp bgutil-ytdlp-pot-provider
+          # Chromium para el fallback de Facebook Ads (si no, se re-descargan
+          # ~170MB en runtime la primera vez que alguien manda un anuncio)
+          python -m playwright install chromium
+
+      - name: Correr bot (5.5 horas)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          YOUTUBE_COOKIES:    ${{ secrets.YOUTUBE_COOKIES }}
+          INSTAGRAM_COOKIES:  ${{ secrets.INSTAGRAM_COOKIES }}
+          REDDIT_COOKIES:     ${{ secrets.REDDIT_COOKIES }}
+          REDGIFS_COOKIES:    ${{ secrets.REDGIFS_COOKIES }}
+          TWITTER_COOKIES:    ${{ secrets.TWITTER_COOKIES }}
+          FACEBOOK_COOKIES:   ${{ secrets.FACEBOOK_COOKIES }}
+          PROXY_URL:          ${{ secrets.PROXY_URL }}
+          FB_PROXY_URL:       ${{ secrets.FB_PROXY_URL }}
+        run: |
+          START=$(date +%s)
+          timeout --signal=SIGINT 19800 python bot.py; EXIT=$?
+          ELAPSED=$(( $(date +%s) - START ))
+          echo "bot.py terminó con código $EXIT tras ${ELAPSED}s"
+          # Si murió en menos de 5 min es un error de arranque: NO relanzar en
+          # cadena (evita un loop infinito de corridas); el cron lo reintentará.
+          if [ "$ELAPSED" -lt 300 ]; then
+            echo "::error::El bot murió a los ${ELAPSED}s — revisa los logs de arriba"
+            exit 1
+          fi
+
+      - name: Relanzar siguiente corrida
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --repo ${{ github.repository }}

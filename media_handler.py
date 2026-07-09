@@ -90,6 +90,32 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         clean_url    = get_clean_url(info)
 
+        # Twitter con varias fotos: mandar el álbum completo, no solo la 1ª
+        all_images = (info.get("all_images") or []) if isinstance(info, dict) else []
+        if platform == "twitter" and len(all_images) > 1:
+            caption_text = format_message(platform, info, clean_url)
+            await processing_msg.delete()
+            media_caption, overflow = _split_caption(caption_text)
+            group = [
+                InputMediaPhoto(media=u,
+                                caption=(media_caption if i == 0 else None),
+                                parse_mode="Markdown")
+                for i, u in enumerate(all_images[:10])
+            ]
+            try:
+                await update.message.reply_media_group(media=group)
+            except BadRequest:
+                # Markdown inválido en el caption: reintento en texto plano
+                plain = [InputMediaPhoto(media=u,
+                                         caption=(caption_text[:CAPTION_LIMIT] if i == 0 else None))
+                         for i, u in enumerate(all_images[:10])]
+                await update.message.reply_media_group(media=plain)
+            if overflow:
+                await _send_long_text(update, overflow)
+            if isinstance(file_path, str) and not file_path.startswith("URL:"):
+                _cleanup(file_path)
+            return
+
         # Twitter imagen: file_path puede ser "URL:https://..." para envío directo
         if isinstance(file_path, str) and file_path.startswith("URL:"):
             img_url = file_path[4:]
@@ -126,6 +152,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # YouTube y TikTok: además del video, enviar también el audio extraído.
         if platform in AUDIO_PLATFORMS and ext not in IMAGE_EXTS and ext != ".gif":
             await _send_audio(update, file_path, info)
+
+        # Borrar el temporal: el proceso corre horas y sin esto se llena el disco
+        _cleanup(file_path)
 
     except Exception as e:
         logger.error(f"Error procesando {url}: {e}")
@@ -177,24 +206,32 @@ async def _handle_reddit(update, processing_msg, url: str):
     # ── Galería ────────────────────────────────────────────────────
     if isinstance(files, list) and len(files) > 1:
         count   = len(files)
+        # Caption SIN Markdown: los títulos de Reddit traen *, _ y [ que
+        # rompen el parseo de Telegram y tumbaban el álbum completo.
         caption = (
-            f"👽 *Reddit* · 🖼️ Galería ({count} fotos)\n\n"
-            f"📌 *Título:* {title}\n\n"
-            f"🔗 [Ver post]({post_url})"
-        )
-        # Telegram acepta hasta 10 en un media group
-        media_group = []
-        for i, fp in enumerate(files[:10]):
+            f"👽 Reddit · 🖼️ Galería ({count} fotos)\n\n"
+            f"📌 {title}\n\n"
+            f"🔗 {post_url}"
+        )[:CAPTION_LIMIT]
+        # sendMediaGroup no acepta animaciones: los .gif/.mp4 van aparte.
+        # Telegram acepta hasta 10 items por media group.
+        media_group, animated = [], []
+        for fp in files[:10]:
             ext = os.path.splitext(fp)[1].lower()
-            cap = caption if i == 0 else None
+            if ext in (".gif", ".mp4"):
+                animated.append(fp)
+                continue
             with open(fp, "rb") as f:
                 data = f.read()
-            if ext in (".gif",):
-                media_group.append(InputMediaAnimation(media=data, caption=cap, parse_mode="Markdown"))
-            else:
-                media_group.append(InputMediaPhoto(media=data, caption=cap, parse_mode="Markdown"))
-
-        await update.message.reply_media_group(media=media_group)
+            media_group.append(
+                InputMediaPhoto(media=data, caption=(caption if not media_group else None))
+            )
+        if media_group:
+            await update.message.reply_media_group(media=media_group)
+        for j, fp in enumerate(animated):
+            cap = caption if (not media_group and j == 0) else None
+            with open(fp, "rb") as f:
+                await update.message.reply_animation(animation=f, caption=cap)
         _cleanup(files)
         return
 

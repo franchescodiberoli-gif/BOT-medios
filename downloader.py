@@ -1,6 +1,8 @@
 import yt_dlp
 import os
 import re
+import sys
+import time
 import tempfile
 import logging
 import requests
@@ -17,6 +19,13 @@ REDGIFS_COOKIES   = os.environ.get("REDGIFS_COOKIES",   None)
 TWITTER_COOKIES   = os.environ.get("TWITTER_COOKIES",   None)
 FACEBOOK_COOKIES  = os.environ.get("FACEBOOK_COOKIES",  None)
 COOKIES_FILE      = os.environ.get("COOKIES_FILE",      None)
+
+# Credenciales opcionales de la API oficial de Reddit (crear app "script" gratis
+# en reddit.com/prefs/apps). Reddit bloquea el .json anónimo desde IPs de
+# datacenter; con esto el bot usa OAuth app-only, que sí está permitido.
+REDDIT_CLIENT_ID     = os.environ.get("REDDIT_CLIENT_ID",     "")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
+REDDIT_UA            = "script:mediabot:2.0 (bot personal de Telegram)"
 
 PROXY   = os.environ.get("PROXY_URL", "")
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else {}
@@ -93,32 +102,9 @@ def _cookies(platform: str) -> str | None:
     return None
 
 
-def _extract_video_id(url: str) -> str | None:
-    for pat in [
-        r"v=([a-zA-Z0-9_-]{11})",
-        r"youtu\.be/([a-zA-Z0-9_-]{11})",
-        r"shorts/([a-zA-Z0-9_-]{11})",
-        r"embed/([a-zA-Z0-9_-]{11})",
-        r"live/([a-zA-Z0-9_-]{11})",
-    ]:
-        m = re.search(pat, url)
-        if m:
-            return m.group(1)
-    return None
-
-
 # ═══════════════════════════════════════════════════════════════════
-# COBALT
+# Descarga directa
 # ═══════════════════════════════════════════════════════════════════
-
-COBALT_INSTANCES = [
-    "https://api.cobalt.tools",
-    "https://cobalt.api.timelessnesses.me",
-    "https://cob.frytea.com",
-    "https://cobalt.datura.network",
-    "https://cobalt.svaba.site",
-]
-
 
 def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
     try:
@@ -137,48 +123,6 @@ def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
     return None
 
 
-def _try_cobalt(url: str) -> tuple[str | None, dict | None]:
-    headers = {
-        "Content-Type": "application/json",
-        "Accept":       "application/json",
-        "User-Agent":   "MediaBot/2.0",
-    }
-    for instance in COBALT_INSTANCES:
-        try:
-            logger.info(f"→ cobalt [{instance}]...")
-            r = requests.post(instance, json={"url": url}, headers=headers,
-                              timeout=25, proxies=PROXIES, verify=False)
-            if r.status_code != 200:
-                continue
-            data   = r.json()
-            status = data.get("status", "")
-
-            if status in ("stream", "tunnel", "redirect") and data.get("url"):
-                fp = _download_direct_url(data["url"])
-                if fp:
-                    vid_id = _extract_video_id(url) or "video"
-                    return fp, {
-                        "id": vid_id, "title": data.get("filename", vid_id),
-                        "webpage_url": url, "extractor_key": "Youtube",
-                    }
-
-            if status == "picker" and data.get("picker"):
-                for item in data["picker"]:
-                    if item.get("url"):
-                        fp = _download_direct_url(item["url"])
-                        if fp:
-                            vid_id = _extract_video_id(url) or "video"
-                            return fp, {
-                                "id": vid_id, "title": vid_id,
-                                "webpage_url": url, "extractor_key": "Youtube",
-                            }
-            if status == "error":
-                logger.warning(f"cobalt {instance} → {data.get('error', {}).get('code','?')}")
-        except Exception as e:
-            logger.warning(f"cobalt {instance} → {e}")
-    return None, None
-
-
 # ═══════════════════════════════════════════════════════════════════
 # yt-dlp
 # ═══════════════════════════════════════════════════════════════════
@@ -192,7 +136,9 @@ def _ytdlp_download(url: str, client: str, cookies: str | None) -> tuple[str | N
         "noplaylist":          True,
         "socket_timeout":      60,
         "nocheckcertificate":  True,
-        "format":              "best[height<=720]/best",
+        # Los formatos progresivos ("best" en un solo archivo) casi ya no existen
+        # en YouTube: hay que bajar video+audio por separado y unirlos con ffmpeg.
+        "format":              "bv*[height<=720]+ba/b[height<=720]/b",
         "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
         "extractor_args":      {"youtube": {"player_client": [client]}},
     }
@@ -212,12 +158,14 @@ def _ytdlp_download(url: str, client: str, cookies: str | None) -> tuple[str | N
         err = str(e)
         if "DRM" in err or "private" in err.lower():
             return "PRIVATE", None
-        logger.warning(f"yt-dlp [{client}]: {err[:120]}")
+        logger.warning(f"yt-dlp [{client}]: {err[:300]}")
     return None, None
 
 
 def _try_ytdlp_all(url: str, cookies: str | None) -> tuple[str | None, dict | None]:
-    for client in ["tv_embedded", "mweb", "ios", "web"]:
+    # mweb necesita PO Token — lo genera el plugin bgutil-ytdlp-pot-provider
+    # (servidor en 127.0.0.1:4416). tv y web_embedded no requieren PO Token.
+    for client in ["mweb", "tv", "web_embedded"]:
         fp, info = _ytdlp_download(url, client, cookies)
         if fp == "PRIVATE":
             return None, None
@@ -251,14 +199,58 @@ def _redgifs_get_token(session: requests.Session) -> str | None:
     return None
 
 
+def _redgifs_ytdlp(gif_id: str) -> tuple[str | None, dict | None]:
+    """Fallback: el extractor de Redgifs de yt-dlp se mantiene al día
+    y renueva el token solo cuando la API devuelve 401/403."""
+    tmp_dir = tempfile.mkdtemp()
+    opts = {
+        "outtmpl":            os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+        "quiet":              True,
+        "no_warnings":        True,
+        "noplaylist":         True,
+        "socket_timeout":     30,
+        "nocheckcertificate": True,
+        "format":             "best",
+    }
+    if PROXY:
+        opts["proxy"] = PROXY
+    try:
+        logger.info(f"→ redgifs yt-dlp [{gif_id}]...")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.redgifs.com/watch/{gif_id}",
+                                    download=True) or {}
+            for f in os.listdir(tmp_dir):
+                fp = os.path.join(tmp_dir, f)
+                if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
+                    tags = info.get("tags") or info.get("categories") or []
+                    return fp, {
+                        "id":            gif_id,
+                        "title":         (info.get("title") or "").strip(),
+                        "uploader":      info.get("uploader") or "",
+                        "tags":          tags,
+                        "description":   " ".join(f"#{t}" for t in tags),
+                        "webpage_url":   f"https://www.redgifs.com/watch/{gif_id}",
+                        "extractor_key": "RedGifs",
+                        "ext":           os.path.splitext(fp)[1].lstrip("."),
+                    }
+    except Exception as e:
+        logger.error(f"_redgifs_ytdlp: {str(e)[:200]}")
+    return None, None
+
+
 def download_redgifs(url: str) -> tuple[str | None, dict | None]:
     """Descarga un video de redgifs.com/watch/<id> via API con proxy."""
     m = re.search(r"redgifs\.com/(?:watch|ifr)/([a-zA-Z0-9]+)", url)
     if not m:
         return None, None
 
-    gif_id  = m.group(1).lower()
-    session = requests.Session()
+    gif_id = m.group(1).lower()
+    # Sesión con huella TLS de Chrome real: Redgifs está tras Cloudflare y
+    # suele rechazar (403) la huella de requests desde IPs de datacenter.
+    if _HAS_CFFI:
+        session = cffi_requests.Session(impersonate=FB_IMPERSONATE)
+    else:
+        session = requests.Session()
 
     # Cargar cookies de redgifs si existen
     for line in (REDGIFS_COOKIES or "").strip().splitlines():
@@ -295,7 +287,7 @@ def download_redgifs(url: str) -> tuple[str | None, dict | None]:
         video_url = urls.get("hd") or urls.get("sd") or urls.get("gif")
         if not video_url:
             logger.warning(f"redgifs: sin URL de video para {gif_id}")
-            return None, None
+            return _redgifs_ytdlp(gif_id)
 
         ext = "mp4" if ".mp4" in video_url else "gif"
         dl_headers = {**api_headers, "Accept": "*/*"}
@@ -323,7 +315,8 @@ def download_redgifs(url: str) -> tuple[str | None, dict | None]:
     except Exception as e:
         logger.error(f"download_redgifs error: {e}")
 
-    return None, None
+    # La API nativa falló (token, 401/403, tamaño): probar con yt-dlp
+    return _redgifs_ytdlp(gif_id)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -345,6 +338,17 @@ def _fxtwitter_info(tweet_id: str) -> dict | None:
             if r.status_code == 200:
                 data = r.json()
                 tweet = data.get("tweet") or data.get("data") or {}
+                if not tweet and "media_extended" in data:
+                    # vxtwitter responde un objeto plano (sin clave "tweet"):
+                    # adaptarlo al formato de fxtwitter que espera el resto.
+                    tweet = {
+                        "text": data.get("text", ""),
+                        "media": {"all": [
+                            {"type": m.get("type"), "url": m.get("url")}
+                            for m in (data.get("media_extended") or [])
+                            if m.get("url")
+                        ]},
+                    }
                 if tweet:
                     logger.info(f"fxtwitter [{fx_host}] OK para {tweet_id}")
                     return tweet
@@ -465,10 +469,9 @@ def download_twitter(url: str) -> tuple[str | None, dict | None]:
 # ═══════════════════════════════════════════════════════════════════
 
 def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
+    # yt-dlp directo. Cobalt se quitó de este flujo: sus instancias públicas
+    # ya no aceptan peticiones sin API key y solo metían ~2 min de espera.
     cookies = _cookies(platform)
-    fp, info = _try_cobalt(url)
-    if fp:
-        return fp, info
     return _try_ytdlp_all(url, cookies)
 
 
@@ -702,7 +705,7 @@ def _ensure_playwright():
     if shells or chromes:
         return   # Ya instalado, no re-descargar
     logger.info("fb_ads: instalando Chromium (sin --with-deps)...")
-    ret = os.system("playwright install chromium 2>&1")
+    ret = os.system(f'"{sys.executable}" -m playwright install chromium 2>&1')
     logger.info(f"fb_ads: playwright install terminó con código {ret}")
 
 
@@ -757,8 +760,14 @@ def _playwright_worker(ad_id: str, cookies: dict) -> dict | None:
             page.on("response", _on_response)
 
             logger.info(f"fb_ads playwright: navegando a {page_url[:80]}...")
-            await page.goto(page_url, wait_until="networkidle", timeout=45_000)
-            await page.wait_for_timeout(3_000)
+            # "networkidle" nunca se dispara en facebook.com (long-polling):
+            # usamos domcontentloaded + espera fija, y si el goto expira
+            # seguimos con lo que haya cargado en vez de abortar.
+            try:
+                await page.goto(page_url, wait_until="domcontentloaded", timeout=45_000)
+            except Exception as nav_err:
+                logger.warning(f"fb_ads playwright goto: {nav_err}")
+            await page.wait_for_timeout(5_000)
 
             html = await page.content()
             await browser.close()
@@ -890,11 +899,24 @@ def download_facebook_ads(url: str) -> tuple[str | list[str] | None, dict | None
 
     cookies, cookies_path = _fb_session()
 
-    # ── Intento 1: Scraping HTML con curl_cffi ────────────────────────
+    # ── Intento 1: yt-dlp (solo video) ────────────────────────────────
+    # Va primero: desde ene-2026 Facebook exige un challenge de JS en
+    # /ads/library que rompe el scraping por requests; el extractor
+    # FacebookAds de yt-dlp actualizado ya resuelve ese challenge.
+    logger.info(f"→ fb_ads yt-dlp para ID {ad_id}...")
+    fp, info = _try_fb_ads_ytdlp(ad_id, cookies_path)
+    if fp:
+        if info:
+            info.setdefault("extractor_key", "FacebookAds")
+            info.setdefault("type", "video")
+        return fp, info or {**base_info, "type": "video"}
+
+    # ── Intento 2: Scraping HTML con curl_cffi ────────────────────────
     logger.info(f"→ fb_ads scraping HTML para ID {ad_id}...")
     scraped = _scrape_fb_ads_html(ad_id, cookies)
 
-    # ── Intento 2: Playwright (navegador real, resuelve JS challenge) ──
+    # ── Intento 3: Playwright (navegador real, resuelve JS challenge) ──
+    # Único camino para anuncios de imagen/carrusel si el scraping falla.
     if not scraped:
         logger.info(f"→ fb_ads Playwright para ID {ad_id}...")
         scraped = _scrape_fb_ads_playwright(ad_id, cookies)
@@ -926,23 +948,92 @@ def download_facebook_ads(url: str) -> tuple[str | list[str] | None, dict | None
                     "count": len(files)}
             return (files if len(files) > 1 else files[0]), info
 
-    # ── Intento 2: yt-dlp (solo video) ────────────────────────────────
-    logger.info(f"→ fb_ads yt-dlp para ID {ad_id}...")
-    fp, info = _try_fb_ads_ytdlp(ad_id, cookies_path)
-    if fp:
-        if info:
-            info.setdefault("extractor_key", "FacebookAds")
-            info.setdefault("type", "video")
-        return fp, info or {**base_info, "type": "video"}
-
-    # ── Intento 3: Cobalt (solo video) ────────────────────────────────
-    logger.info(f"→ fb_ads cobalt para ID {ad_id}...")
-    lib_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
-    fp, cobalt_info = _try_cobalt(lib_url)
-    if fp:
-        return fp, cobalt_info or {**base_info, "type": "video"}
-
     logger.error(f"download_facebook_ads: todos los métodos fallaron para {ad_id}")
+    return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Threads  ──  yt-dlp NO tiene extractor de Threads: descarga propia
+# ═══════════════════════════════════════════════════════════════════
+
+def download_threads(url: str) -> tuple[str | None, dict | None]:
+    """Baja el HTML del post (huella de Chrome real) y extrae el video o la
+    imagen del JSON embebido. threads.com es el dominio canónico desde 2025."""
+    url = re.sub(r"https?://(www\.)?threads\.(com|net)", "https://www.threads.com", url)
+    info = {
+        "id": "", "title": "Threads post", "description": "",
+        "webpage_url": url, "extractor_key": "Threads",
+    }
+    try:
+        if _HAS_CFFI:
+            r = cffi_requests.get(url, impersonate=FB_IMPERSONATE, timeout=30,
+                                  headers={"Accept-Language": "en"}, verify=False)
+        else:
+            r = requests.get(url, headers=_fb_headers(), timeout=30,
+                             proxies=PROXIES, verify=False)
+        html = r.text
+
+        cap = re.search(r'"caption"\s*:\s*\{[^}]*?"text"\s*:\s*"([^"]*)"', html)
+        if cap:
+            info["description"] = _fb_unescape(cap.group(1)).replace("\\n", "\n")
+
+        m = re.search(r'"video_versions"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"([^"]+)"', html)
+        if m:
+            fp = _download_direct_url(_fb_unescape(m.group(1)), "mp4")
+            if fp:
+                info["ext"] = "mp4"
+                return fp, info
+
+        m = re.search(r'"image_versions2"\s*:\s*\{\s*"candidates"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"([^"]+)"', html)
+        if m:
+            fp = _dl_image(_fb_unescape(m.group(1)), "jpg")
+            if fp:
+                info["ext"] = "jpg"
+                return fp, info
+        logger.warning("download_threads: sin media en el HTML (¿post privado o login wall?)")
+    except Exception as e:
+        logger.error(f"download_threads: {e}")
+    return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Instagram  ──  fallback de fotos vía página de embed
+# ═══════════════════════════════════════════════════════════════════
+
+def _instagram_image_fallback(url: str) -> tuple[str | None, dict | None]:
+    """El extractor de Instagram de yt-dlp solo saca VIDEO; para posts de foto
+    intentamos la página de embed, que es menos estricta con el login."""
+    m = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url)
+    if not m:
+        return None, None
+    shortcode = m.group(1)
+    embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+    try:
+        if _HAS_CFFI:
+            r = cffi_requests.get(embed_url, impersonate=FB_IMPERSONATE,
+                                  timeout=30, verify=False)
+        else:
+            r = requests.get(embed_url, headers=_fb_headers(), timeout=30,
+                             proxies=PROXIES, verify=False)
+        html = r.text
+        img_url = None
+        m2 = re.search(r'"display_url"\s*:\s*"([^"]+)"', html)
+        if m2:
+            img_url = _fb_unescape(m2.group(1))
+        else:
+            m2 = re.search(r'class="EmbeddedMediaImage"[^>]+src="([^"]+)"', html)
+            if m2:
+                img_url = _fb_unescape(m2.group(1))
+        if img_url:
+            fp = _dl_image(img_url, "jpg")
+            if fp:
+                return fp, {
+                    "id": shortcode, "title": "Instagram post", "description": "",
+                    "webpage_url": f"https://www.instagram.com/p/{shortcode}/",
+                    "extractor_key": "Instagram", "ext": "jpg",
+                }
+    except Exception as e:
+        logger.warning(f"_instagram_image_fallback: {e}")
     return None, None
 
 
@@ -951,9 +1042,24 @@ def download_facebook_ads(url: str) -> tuple[str | list[str] | None, dict | None
 # ═══════════════════════════════════════════════════════════════════
 
 def download_media(url: str, platform: str = None) -> tuple[str | None, dict | None]:
-    # Threads: forzar threads.net en todos los casos
-    if "threads.com" in url or "threads.net" in url:
-        url = re.sub(r"https?://(www\.)?threads\.(com|net)", "https://www.threads.net", url)
+    # Threads no tiene extractor en yt-dlp: descargador propio
+    if platform == "threads" or "threads.com" in url or "threads.net" in url:
+        return download_threads(url)
+
+    # Links /share/ de Instagram (botón compartir de la app): yt-dlp los
+    # rechaza; hay que resolver el redirect a la URL canónica primero.
+    if "instagram.com/share/" in url:
+        try:
+            if _HAS_CFFI:
+                rr = cffi_requests.get(url, impersonate=FB_IMPERSONATE,
+                                       timeout=20, allow_redirects=True, verify=False)
+            else:
+                rr = requests.get(url, headers=_HEADERS, timeout=20,
+                                  allow_redirects=True, verify=False)
+            url = str(rr.url)
+            logger.info(f"IG share resuelto a: {url[:80]}")
+        except Exception as e:
+            logger.warning(f"resolviendo share de IG: {e}")
 
     if platform in ("youtube_short", "youtube_long"):
         return download_youtube(url, platform)
@@ -987,6 +1093,15 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
     if cookies:
         opts["cookiefile"] = cookies
 
+    # Huella TLS de Chrome real: sin esto Facebook responde "Cannot parse
+    # data" y v.redd.it da 403 (fingerprinting de Cloudflare).
+    if _HAS_CFFI:
+        try:
+            from yt_dlp.networking.impersonate import ImpersonateTarget
+            opts["impersonate"] = ImpersonateTarget("chrome")
+        except Exception:
+            pass
+
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -1003,6 +1118,10 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
                 return fp, info
             return _download_twitter_image(url)
         logger.error(f"download_media error: {e}")
+
+    # Instagram: yt-dlp solo saca video; para posts de foto probamos el embed
+    if platform == "instagram":
+        return _instagram_image_fallback(url)
     return None, None
 
 
@@ -1030,45 +1149,27 @@ def _get_twitter_image_url(url: str) -> tuple[str | None, dict | None]:
         "Accept":     "application/json",
     }
 
-    # ── Método 1: fxtwitter — no requiere cookies ni query IDs ──────
-    # API pública estable: https://github.com/FixTweet/FxTwitter
-    for fx_host in ("api.fxtwitter.com", "api.vxtwitter.com"):
-        try:
-            r = requests.get(
-                f"https://{fx_host}/status/{tweet_id}",
-                headers=hdrs, timeout=20, verify=False,
-            )
-            if r.status_code == 200:
-                data  = r.json()
-                tweet = data.get("tweet", {})
-                text  = tweet.get("text", "")
-                media = tweet.get("media", {})
-
-                # fxtwitter devuelve fotos en "photos" o mezcladas en "all"
-                photos = media.get("photos") or []
-                if not photos:
-                    # filtrar del array "all" los que sean tipo photo/image
-                    photos = [
-                        item for item in (media.get("all") or [])
-                        if item.get("type") in ("photo", "image")
-                    ]
-
-                if photos:
-                    img_url = photos[0].get("url", "")
-                    if img_url:
-                        all_images = [p.get("url", "") for p in photos if p.get("url")]
-                        info = {
-                            **base_info,
-                            "title":       text[:100] or base_info["title"],
-                            "description": text,
-                            "ext":         "jpg",
-                            "all_images":  all_images,
-                        }
-                        return f"URL:{img_url}", info
-            else:
-                logger.warning(f"fxtwitter [{fx_host}]: {r.status_code}")
-        except Exception as e:
-            logger.warning(f"_get_twitter_image_url fxtwitter [{fx_host}]: {e}")
+    # ── Método 1: fxtwitter/vxtwitter — no requiere cookies ni query IDs ──
+    tweet = _fxtwitter_info(tweet_id)
+    if tweet:
+        text  = tweet.get("text", "")
+        media = tweet.get("media", {}) or {}
+        photos = media.get("photos") or [
+            item for item in (media.get("all") or [])
+            if item.get("type") in ("photo", "image")
+        ]
+        if photos:
+            img_url = photos[0].get("url", "")
+            if img_url:
+                all_images = [p.get("url", "") for p in photos if p.get("url")]
+                info = {
+                    **base_info,
+                    "title":       text[:100] or base_info["title"],
+                    "description": text,
+                    "ext":         "jpg",
+                    "all_images":  all_images,
+                }
+                return f"URL:{img_url}", info
 
     # ── Método 2: Syndication API (fallback) ────────────────────────
     try:
@@ -1134,40 +1235,28 @@ def _download_twitter_image(url: str) -> tuple[str | None, dict | None]:
         "extractor_key": "Twitter",
     }
 
-    # ── Intento 0: fxtwitter — descarga directa de la imagen ──────────
+    # ── Intento 0: fxtwitter/vxtwitter — descarga directa de la imagen ──
     # Este es el método más confiable y no requiere cookies ni auth
-    hdrs = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-        "Accept":     "application/json",
-    }
-    for fx_host in ("api.fxtwitter.com", "api.vxtwitter.com"):
-        try:
-            r = requests.get(
-                f"https://{fx_host}/status/{tweet_id}",
-                headers=hdrs, timeout=20, verify=False,
-            )
-            if r.status_code == 200:
-                data   = r.json()
-                tweet  = data.get("tweet", {})
-                text   = tweet.get("text", "")
-                media  = tweet.get("media", {})
-                photos = media.get("photos") or [
-                    i for i in (media.get("all") or [])
-                    if i.get("type") in ("photo", "image")
-                ]
-                if photos:
-                    img_url = photos[0].get("url", "")
-                    if img_url:
-                        fp = _dl_image(img_url, "jpg")
-                        if fp:
-                            return fp, {
-                                **base_info,
-                                "title":       text[:100] or base_info["title"],
-                                "description": text,
-                                "ext":         "jpg",
-                            }
-        except Exception as e:
-            logger.warning(f"_download_twitter_image fxtwitter [{fx_host}]: {e}")
+    tweet = _fxtwitter_info(tweet_id)
+    if tweet:
+        text   = tweet.get("text", "")
+        media  = tweet.get("media", {}) or {}
+        photos = media.get("photos") or [
+            i for i in (media.get("all") or [])
+            if i.get("type") in ("photo", "image")
+        ]
+        if photos:
+            img_url = photos[0].get("url", "")
+            if img_url:
+                fp = _dl_image(img_url, "jpg")
+                if fp:
+                    return fp, {
+                        **base_info,
+                        "title":       text[:100] or base_info["title"],
+                        "description": text,
+                        "ext":         "jpg",
+                        "all_images":  [p.get("url", "") for p in photos if p.get("url")],
+                    }
 
     cookies = _cookies("twitter")
 
@@ -1219,8 +1308,10 @@ def _download_twitter_image(url: str) -> tuple[str | None, dict | None]:
                 try:
                     return super().extract_info(url, download=download, **kw)
                 except Exception as exc:
-                    if "No video" in str(exc) and self._last_info:
-                        return self._last_info
+                    # captured_info se llena en process_ie_result; YoutubeDL
+                    # no tiene ningún atributo _last_info.
+                    if "No video" in str(exc) and captured_info:
+                        return captured_info
                     raise
             def process_ie_result(self, ie_result, download=True, extra_info=None):
                 captured_info.update(ie_result)
@@ -1353,18 +1444,140 @@ _HEADERS  = {
 }
 
 
+_reddit_token = {"value": None, "exp": 0.0}
+
+
+def _reddit_oauth_token() -> str | None:
+    """Token app-only de la API oficial de Reddit (si hay credenciales)."""
+    if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET):
+        return None
+    if _reddit_token["value"] and time.time() < _reddit_token["exp"] - 60:
+        return _reddit_token["value"]
+    try:
+        r = requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": REDDIT_UA}, timeout=20,
+        )
+        r.raise_for_status()
+        j = r.json()
+        _reddit_token["value"] = j.get("access_token")
+        _reddit_token["exp"]   = time.time() + int(j.get("expires_in", 3600))
+        return _reddit_token["value"]
+    except Exception as e:
+        logger.warning(f"_reddit_oauth_token: {e}")
+    return None
+
+
+def _resolve_reddit_url(url: str) -> str:
+    """Resuelve share-links (/r/<sub>/s/<token>) y acortadores redd.it
+    al link real del post (son un redirect)."""
+    if "/s/" not in url and not re.match(r"https?://(www\.)?redd\.it/", url):
+        return url
+    try:
+        if _HAS_CFFI:
+            r = cffi_requests.get(url, impersonate=FB_IMPERSONATE, timeout=20,
+                                  allow_redirects=True, verify=False)
+        else:
+            r = requests.get(url, headers=_HEADERS, proxies=PROXIES,
+                             timeout=20, allow_redirects=True, verify=False)
+        final = str(r.url)
+        if "reddit.com" in final:
+            logger.info(f"reddit share resuelto a: {final[:80]}")
+            return final
+    except Exception as e:
+        logger.warning(f"_resolve_reddit_url: {e}")
+    return url
+
+
 def _fetch_post_json(url: str) -> dict | None:
     """Obtiene el dict de datos del primer post de la URL de Reddit."""
+    url   = _resolve_reddit_url(url)
     clean = re.split(r"[?#]", url)[0].rstrip("/")
+
+    # 1) API oficial con OAuth: la vía confiable desde IPs de datacenter
+    token = _reddit_oauth_token()
+    if token:
+        m = re.search(r"/comments/([a-z0-9]+)", clean, re.IGNORECASE)
+        if m:
+            try:
+                r = requests.get(
+                    f"https://oauth.reddit.com/comments/{m.group(1)}?raw_json=1",
+                    headers={"Authorization": f"Bearer {token}",
+                             "User-Agent": REDDIT_UA},
+                    timeout=20,
+                )
+                r.raise_for_status()
+                data = r.json()
+                return data[0]["data"]["children"][0]["data"]
+            except Exception as e:
+                logger.warning(f"_fetch_post_json oauth: {e}")
+
+    # 2) .json público — Reddit lo bloquea (403) desde muchas IPs de
+    #    datacenter; con huella de Chrome real a veces pasa.
     try:
-        resp = requests.get(clean + ".json", headers=_HEADERS,
-                            proxies=PROXIES, timeout=20, verify=False)
+        if _HAS_CFFI:
+            resp = cffi_requests.get(clean + ".json", headers=_HEADERS,
+                                     impersonate=FB_IMPERSONATE,
+                                     timeout=20, verify=False)
+        else:
+            resp = requests.get(clean + ".json", headers=_HEADERS,
+                                proxies=PROXIES, timeout=20, verify=False)
         resp.raise_for_status()
         data = resp.json()
         return data[0]["data"]["children"][0]["data"]
     except Exception as e:
-        logger.error(f"_fetch_post_json error: {e}")
+        logger.error(
+            f"_fetch_post_json error: {e} — si esto es un 403 en GitHub Actions, "
+            "crea una app gratis en reddit.com/prefs/apps y configura los secrets "
+            "REDDIT_CLIENT_ID y REDDIT_CLIENT_SECRET"
+        )
     return None
+
+
+def _download_vreddit(video_id: str) -> tuple[str | None, dict | None]:
+    """Baja un video v.redd.it CON audio. El fallback_url es SOLO la pista de
+    video (Reddit sirve DASH con video y audio separados): hay que darle el
+    manifiesto a yt-dlp para que baje ambos y los una con ffmpeg."""
+    dash = f"https://v.redd.it/{video_id}/DASHPlaylist.mpd"
+    tmp_dir = tempfile.mkdtemp()
+    opts = {
+        "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+        "quiet":               True,
+        "no_warnings":         True,
+        "merge_output_format": "mp4",
+        "noplaylist":          True,
+        "socket_timeout":      30,
+        "nocheckcertificate":  True,
+        "format":              "bv*+ba/b",
+        "http_headers":        {"Referer": "https://www.reddit.com/"},
+    }
+    if PROXY:
+        opts["proxy"] = PROXY
+    if _HAS_CFFI:
+        try:
+            from yt_dlp.networking.impersonate import ImpersonateTarget
+            opts["impersonate"] = ImpersonateTarget("chrome")
+        except Exception:
+            pass
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(dash, download=True)
+            for f in os.listdir(tmp_dir):
+                fp = os.path.join(tmp_dir, f)
+                if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
+                    return fp, {
+                        "title":         "Reddit video",
+                        "webpage_url":   f"https://v.redd.it/{video_id}",
+                        "extractor_key": "Reddit",
+                        "ext":           "mp4",
+                        "type":          "video",
+                        "duration":      (info or {}).get("duration"),
+                    }
+    except Exception as e:
+        logger.warning(f"_download_vreddit: {str(e)[:200]}")
+    return None, None
 
 
 def _dl_image(img_url: str, ext: str = "jpg") -> str | None:
@@ -1390,6 +1603,23 @@ def download_reddit_post(url: str) -> tuple[str | list[str] | None, dict | None]
       - (list[str], info) → galería de imágenes
       - (None, None)      → error
     """
+    # Links directos de media: no son posts, no tienen .json
+    m = re.match(r"https?://i\.redd\.it/([^?#]+)", url)
+    if m:
+        fname = m.group(1)
+        ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else "jpg"
+        fp = _dl_image(url, ext)
+        if fp:
+            tipo = "gif" if ext == "gif" else ("video" if ext == "mp4" else "image")
+            return fp, {"title": "Reddit", "webpage_url": url,
+                        "extractor_key": "Reddit", "ext": ext, "type": tipo}
+        return None, None
+    m = re.match(r"https?://v\.redd\.it/([a-zA-Z0-9]+)", url)
+    if m:
+        fp, info = _download_vreddit(m.group(1))
+        if fp:
+            return fp, info
+
     post = _fetch_post_json(url)
     if not post:
         return None, None
@@ -1415,10 +1645,14 @@ def download_reddit_post(url: str) -> tuple[str | list[str] | None, dict | None]
                 continue
             mime = media.get("m", "image/jpeg")
             ext  = mime.split("/")[-1] if "/" in mime else "jpg"
-            # URL de máxima resolución
-            img_url = (media.get("s", {}).get("u", "") or "").replace("&amp;", "&")
+            # URL de máxima resolución. Los items animados de galería no
+            # traen "u": traen "gif"/"mp4".
+            s = media.get("s", {}) or {}
+            img_url = (s.get("u") or s.get("gif") or s.get("mp4") or "").replace("&amp;", "&")
             if not img_url:
                 continue
+            if not s.get("u"):
+                ext = "gif" if s.get("gif") else "mp4"
             fp = _dl_image(img_url, ext)
             if fp:
                 files.append(fp)
@@ -1483,16 +1717,22 @@ def download_reddit_post(url: str) -> tuple[str | list[str] | None, dict | None]
     rv = (post.get("media") or {}).get("reddit_video") or \
          (post.get("secure_media") or {}).get("reddit_video")
     if rv:
-        video_url = rv.get("fallback_url", "").replace("?source=fallback", "")
-        if video_url:
-            fp, info = download_media(video_url, "reddit")
+        # El DASH trae video y audio SEPARADOS: bajar solo fallback_url
+        # entrega el video mudo. _download_vreddit une las dos pistas.
+        m = re.search(r"v\.redd\.it/([a-zA-Z0-9]+)",
+                      f"{rv.get('dash_url') or ''} {rv.get('fallback_url') or ''}")
+        if m:
+            fp, info = _download_vreddit(m.group(1))
             if fp:
-                if info:
-                    info["title"] = title
-                    info["webpage_url"] = url
-                else:
-                    info = {**base_info, "ext": "mp4", "type": "video"}
+                info["title"] = title
+                info["webpage_url"] = url
                 return fp, info
+        # Último recurso: fallback_url directo (puede venir sin audio)
+        video_url = (rv.get("fallback_url") or "").replace("?source=fallback", "")
+        if video_url:
+            fp = _download_direct_url(video_url, "mp4")
+            if fp:
+                return fp, {**base_info, "ext": "mp4", "type": "video"}
 
     # ── 5. Intentar con yt-dlp directamente ───────────────────────
     fp, info = download_media(url, "reddit")

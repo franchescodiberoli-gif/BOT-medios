@@ -1,0 +1,50 @@
+name: Probar descarga de YouTube
+
+# Prueba manual: descarga 2 videos públicos desde el runner (misma IP de
+# datacenter y mismo setup que usa el bot). Útil para diagnosticar cuando
+# YouTube vuelva a cambiar algo, sin tener que probar por Telegram.
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Servidor de PO Tokens
+        run: |
+          docker run -d --init --name bgutil-provider -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          timeout 60 bash -c 'until curl -sf http://127.0.0.1:4416/ping > /dev/null; do sleep 2; done' \
+            && echo "Servidor POT listo" || echo "::warning::Servidor POT no respondió"
+
+      - name: Instalar dependencias
+        run: pip install -U yt-dlp bgutil-ytdlp-pot-provider requests PySocks
+
+      - name: Descargar videos de prueba
+        run: |
+          python - <<'EOF'
+          import logging, os
+          logging.basicConfig(level=logging.INFO)
+          from downloader import download_youtube
+
+          pruebas = [
+              ("https://www.youtube.com/watch?v=BaW_jenozKc", "youtube_long"),
+              ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube_long"),
+          ]
+          fallas = 0
+          for url, plataforma in pruebas:
+              fp, info = download_youtube(url, plataforma)
+              if fp and os.path.getsize(fp) > 10_000:
+                  mb = os.path.getsize(fp) / (1024 * 1024)
+                  print(f"OK  {url} -> {fp} ({mb:.1f} MB) titulo={(info or {}).get('title')!r}")
+              else:
+                  print(f"FALLO  {url}")
+                  fallas += 1
+          raise SystemExit(fallas)
+          EOF

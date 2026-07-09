@@ -3,10 +3,12 @@ import re
 PLATFORM_PATTERNS = {
     "instagram": [
         r"instagram\.com\/(p|reel|tv)\/",
+        r"instagram\.com\/(reels|share)\/",
         r"instagr\.am\/",
     ],
     "tiktok": [
         r"tiktok\.com\/@.+\/video\/",
+        r"tiktok\.com\/t\/",
         r"vm\.tiktok\.com\/",
         r"vt\.tiktok\.com\/",
     ],
@@ -31,6 +33,7 @@ PLATFORM_PATTERNS = {
     ],
     "reddit": [
         r"reddit\.com\/r\/.+\/comments\/",
+        r"reddit\.com\/r\/.+\/s\/",
         r"reddit\.com\/user\/.+\/comments\/",
         r"redd\.it\/",
         r"v\.redd\.it\/",
