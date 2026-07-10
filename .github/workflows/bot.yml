@@ -22,9 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -49,7 +49,7 @@ jobs:
           # Esperar a que el servidor responda (máx 60s); si no, el bot igual
           # arranca — los clientes tv/web_embedded funcionan sin PO Token.
           timeout 60 bash -c 'until curl -sf http://127.0.0.1:4416/ping > /dev/null; do sleep 2; done' \
-            && echo "Servidor POT listo" || echo "::warning::Servidor POT no respondió; YouTube usará solo tv/web_embedded"
+            && echo "Servidor POT listo" || echo "::warning::Servidor POT no respondió; YouTube irá sin PO Tokens (más vetos)"
 
       - name: Instalar dependencias
         run: |
@@ -64,6 +64,13 @@ jobs:
           # ~170MB en runtime la primera vez que alguien manda un anuncio).
           # --with-deps instala también las libs de sistema (libnspr4, libnss3).
           python -m playwright install --with-deps chromium
+
+      # yt-dlp se instala SIN pin (-U) a propósito: YouTube cambia seguido y
+      # quedarse en una versión vieja rompe más que actualizar. Este check
+      # convierte un release roto en un fallo con nombre, en vez de que el
+      # bot muera a los pocos segundos sin explicación.
+      - name: Sanity check de imports
+        run: python -c "import yt_dlp, telegram; print('yt-dlp', yt_dlp.version.__version__)"
 
       - name: Correr bot (5.5 horas)
         env:

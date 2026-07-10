@@ -1,0 +1,115 @@
+name: Probar descargas (todas las plataformas)
+
+# Prueba manual: descarga 1 contenido público por plataforma desde el runner
+# (misma IP de datacenter y mismo setup que usa el bot). Útil para ver de un
+# vistazo QUÉ plataforma se rompió sin tener que probar por Telegram.
+# Truena solo si TODAS fallan (infraestructura rota); un fallo individual se
+# reporta como warning con su clase (bot_check, auth_wall, rate_limit...).
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Runtime de JS que yt-dlp necesita para las firmas de YouTube
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Servidor de PO Tokens
+        run: |
+          docker run -d --init --name bgutil-provider -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          timeout 60 bash -c 'until curl -sf http://127.0.0.1:4416/ping > /dev/null; do sleep 2; done' \
+            && echo "Servidor POT listo" || echo "::warning::Servidor POT no respondió"
+
+      - name: Instalar dependencias
+        run: |
+          # ffmpeg: los formatos de YouTube/Reddit vienen con video y audio
+          # separados y sin ffmpeg la fusión aborta.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          pip install -U "yt-dlp[default]" bgutil-ytdlp-pot-provider requests PySocks curl_cffi
+
+      - name: Descargar contenido de prueba por plataforma
+        env:
+          # Mismos secrets que usa el bot, para ejercitar también los pases
+          # con cookies (los que estén vacíos prueban solo el modo anónimo).
+          YOUTUBE_COOKIES:   ${{ secrets.YOUTUBE_COOKIES }}
+          INSTAGRAM_COOKIES: ${{ secrets.INSTAGRAM_COOKIES }}
+          REDDIT_COOKIES:    ${{ secrets.REDDIT_COOKIES }}
+          REDGIFS_COOKIES:   ${{ secrets.REDGIFS_COOKIES }}
+          TWITTER_COOKIES:   ${{ secrets.TWITTER_COOKIES }}
+          FACEBOOK_COOKIES:  ${{ secrets.FACEBOOK_COOKIES }}
+          PROXY_URL:         ${{ secrets.PROXY_URL }}
+        run: |
+          python - <<'EOF'
+          import logging, os
+          logging.basicConfig(level=logging.INFO)
+          from downloader import download_media, download_reddit_post, DownloadBlocked
+
+          # Contenido público, viejo y estable (verificado que existe):
+          pruebas = [
+              # Big Buck Bunny (video abierto de Blender)
+              ("youtube",   "youtube_long", "https://www.youtube.com/watch?v=aqz-KE-bpKQ"),
+              # El huevo récord mundial (post de foto)
+              ("instagram", "instagram",    "https://www.instagram.com/p/BsOGulcndj-/"),
+              # Zach King, ilusión de Harry Potter (video)
+              ("tiktok",    "tiktok",       "https://www.tiktok.com/@zachking/video/6768504823336815877"),
+              # Selfie de Ellen en los Óscar (tweet con foto)
+              ("twitter",   "twitter",      "https://x.com/TheEllenShow/status/440322224407314432"),
+              # Post de Rick Astley en r/pics (imagen)
+              ("reddit",    "reddit",       "https://www.reddit.com/r/pics/comments/haucpf/"),
+          ]
+
+          resultados = []
+          for nombre, plataforma, url in pruebas:
+              print(f"\n===== {nombre} =====")
+              try:
+                  if plataforma == "reddit":
+                      fp, info = download_reddit_post(url)
+                  else:
+                      fp, info = download_media(url, plataforma)
+              except DownloadBlocked as e:
+                  print(f"::warning::FALLO {nombre} clase={e.reason} ({url})")
+                  resultados.append((nombre, f"FALLO ({e.reason})"))
+                  continue
+              except Exception as e:
+                  print(f"::warning::FALLO {nombre} {type(e).__name__}: {str(e)[:200]}")
+                  resultados.append((nombre, f"FALLO ({type(e).__name__})"))
+                  continue
+
+              paths = fp if isinstance(fp, list) else [fp]
+              paths = [p for p in paths if p]
+              # Twitter puede devolver "URL:https://..." (imagen para envío
+              # directo): cuenta como éxito aunque no haya archivo local.
+              directas = [p for p in paths if isinstance(p, str) and p.startswith("URL:")]
+              locales  = [p for p in paths if isinstance(p, str) and not p.startswith("URL:")
+                          and os.path.exists(p)]
+              mb = sum(os.path.getsize(p) for p in locales) / (1024 * 1024)
+              if locales or directas:
+                  detalle = f"{len(locales) + len(directas)} archivo(s), {mb:.1f} MB"
+                  print(f"OK {nombre} → {detalle}")
+                  resultados.append((nombre, f"OK ({detalle})"))
+              else:
+                  print(f"::warning::FALLO {nombre}: sin archivo ({url})")
+                  resultados.append((nombre, "FALLO (sin archivo)"))
+
+          print("\n===== RESUMEN =====")
+          for nombre, res in resultados:
+              print(f"  {nombre:<10} {res}")
+
+          fallas = sum(1 for _, r in resultados if r.startswith("FALLO"))
+          if fallas == len(pruebas):
+              raise SystemExit(1)   # todo roto: infraestructura, no plataformas
+          if fallas:
+              print(f"::warning::{fallas} de {len(pruebas)} plataformas fallaron (ver resumen)")
+          raise SystemExit(0)
+          EOF
