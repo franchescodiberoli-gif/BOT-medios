@@ -7,7 +7,8 @@ from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from url_detector import extract_url, detect_platform
-from downloader import download_media, download_reddit_post, download_facebook_ads, get_clean_url
+from downloader import (download_media, download_reddit_post, download_facebook_ads,
+                        get_clean_url, DownloadBlocked)
 from formatter import format_message
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,36 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 # YouTube y TikTok: además del video, extraer y enviar también el audio.
 AUDIO_PLATFORMS = ("youtube_short", "youtube_long", "tiktok")
+
+# Mensaje por clase de bloqueo (DownloadBlocked.reason). Redacción neutral
+# de plataforma: la misma clase puede venir de YouTube, Instagram, etc.
+_BLOCKED_MSGS = {
+    "bot_check":       ("❌ La plataforma está bloqueando al servidor con su verificación "
+                        "anti-bot.\nNo es culpa del video: suele ser temporal. Reintenta en "
+                        "un rato. Si pasa seguido, la solución de fondo es un proxy "
+                        "residencial (secret PROXY_URL)."),
+    "cookies_invalid": ("❌ Las cookies configuradas expiraron. El bot sigue funcionando en "
+                        "modo anónimo; para renovar el acceso, re-exporta las cookies y "
+                        "actualiza el secret."),
+    "auth_wall":       ("❌ Esa red social exige iniciar sesión para ver ese contenido y no "
+                        "hay sesión válida (cookies ausentes o vencidas)."),
+    "private":         "❌ Ese contenido es privado o de cuenta protegida.",
+    "members":         "❌ Ese video es solo para miembros del canal.",
+    "age_gate":        "❌ Ese video tiene restricción de edad y no hay sesión que la pase.",
+    "drm":             "❌ Ese contenido tiene DRM: no se puede descargar.",
+    "geo":             "❌ Ese contenido no está disponible en el país del servidor.",
+    "unavailable":     "❌ Ese contenido no existe o fue eliminado.",
+    "rate_limit":      ("❌ La red social limitó las peticiones del servidor (rate limit). "
+                        "Espera unos minutos y reintenta."),
+    "auth":            ("❌ La red social rechazó la petición (401/403): veto de IP o sesión "
+                        "vencida."),
+    "no_format":       "❌ No se ofreció ningún formato descargable (posible DRM o bloqueo).",
+    "net":             "❌ Falla de red durante la descarga. Intenta de nuevo.",
+    "blocked":         "❌ La red social está bloqueando la descarga desde el servidor.",
+}
+_BLOCKED_DEFAULT = ("❌ No pude descargar ese contenido.\n"
+                    "Puede que sea privado, requiera login, o la red social lo esté "
+                    "bloqueando.")
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -152,6 +183,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if platform in AUDIO_PLATFORMS and ext not in IMAGE_EXTS and ext != ".gif":
             await _send_audio(update, file_path, info)
 
+    except DownloadBlocked as e:
+        # Bloqueo clasificado: responder el motivo específico, no el genérico.
+        logger.warning(f"[{e.platform}] bloqueado: clase={e.reason}")
+        msg = _BLOCKED_MSGS.get(e.reason, _BLOCKED_DEFAULT)
+        try:
+            await processing_msg.edit_text(msg)
+        except Exception:
+            try:
+                await update.message.reply_text(msg)
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"Error procesando {url}: {e}")
         # processing_msg pudo haber sido borrado ya (p.ej. tras delete()),

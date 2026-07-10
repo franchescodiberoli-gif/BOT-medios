@@ -4,6 +4,7 @@ import re
 import sys
 import time
 import tempfile
+import threading
 import logging
 import requests
 import http.cookiejar
@@ -103,6 +104,121 @@ def _cookies(platform: str) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Clasificación de errores y estado de cookies
+# ═══════════════════════════════════════════════════════════════════
+
+class DownloadBlocked(Exception):
+    """La descarga falló por una causa clasificada (.reason dice cuál).
+    media_handler la usa para responder un mensaje específico en el chat
+    en lugar del genérico "no pude descargar ese contenido"."""
+    def __init__(self, platform: str, reason: str):
+        super().__init__(f"{platform}: {reason}")
+        self.platform = platform
+        self.reason   = reason
+
+
+def _classify_dl_error(msg: str) -> str:
+    """Mapea el mensaje de error de una descarga a una clase corta y
+    accionable (para los logs y para el mensaje que ve el usuario).
+    El orden de los ifs importa: de lo más específico a lo más genérico."""
+    e = (msg or "").lower()
+    # yt-dlp escribe "you're" con apóstrofe tipográfico (U+2019): matchear
+    # "sign in to confirm you" + "bot" esquiva el problema del apóstrofe.
+    if "sign in to confirm you" in e and "bot" in e:
+        return "bot_check"
+    if "confirm your age" in e or "age-restricted" in e or "age restricted" in e:
+        return "age_gate"
+    if "cookies are no longer valid" in e:
+        return "cookies_invalid"
+    if "private video" in e or "this video is private" in e \
+            or "this account is private" in e or "protected" in e:
+        return "private"
+    if "members-only" in e or "join this channel" in e:
+        return "members"
+    if "login required" in e or "requires authentication" in e \
+            or "login page" in e or "log in" in e:
+        return "auth_wall"
+    if "video unavailable" in e or "has been removed" in e \
+            or "no longer available" in e or "content isn't available" in e:
+        return "unavailable"
+    if "not available in your country" in e or "geo restriction" in e \
+            or "geo-restricted" in e:
+        return "geo"
+    if "drm" in e:
+        return "drm"
+    if "http error 429" in e or "too many requests" in e \
+            or "rate-limit reached" in e or "rate limit" in e:
+        return "rate_limit"
+    if "http error 401" in e or "http error 403" in e:
+        return "auth"
+    if "requested format is not available" in e:
+        return "no_format"
+    if "unable to extract" in e or "cannot parse data" in e \
+            or "empty media response" in e or "ip address is blocked" in e:
+        return "blocked"
+    if "timed out" in e or "connection" in e or "unable to download webpage" in e:
+        return "net"
+    return "other"
+
+
+# Clases que NO se arreglan reintentando con otro cliente/cookies:
+_FATAL_REASONS = {"unavailable", "drm", "geo"}
+# Clases que SOLO puede arreglar una sesión iniciada (cookies):
+_NEEDS_LOGIN   = {"private", "age_gate", "members", "auth_wall"}
+# Prioridad al elegir qué razón reportar al usuario si todos los pases fallan:
+_REASON_PRIORITY = ["private", "members", "age_gate", "drm", "geo", "unavailable",
+                    "cookies_invalid", "bot_check", "rate_limit", "auth_wall",
+                    "auth", "no_format", "net", "blocked", "other"]
+
+
+def _pick_reason(reasons: list) -> str:
+    for r in _REASON_PRIORITY:
+        if r in reasons:
+            return r
+    return "other"
+
+
+# Estado de las cookies POR PLATAFORMA dentro de la corrida (proceso ≤5.5 h).
+# Si las cookies fallan _COOKIE_MAX_FAILS veces seguidas con clase de
+# autenticación (o el sitio dice explícitamente que ya no son válidas), se
+# marcan muertas y se omiten el resto de la corrida: unas cookies muertas
+# nunca deben dejar el resultado peor que el modo anónimo. Al relanzarse el
+# workflow (cada 5.5 h) el estado se resetea y se reintentan solas.
+_COOKIE_MAX_FAILS = 3
+_cookie_state = {}
+_cookie_lock  = threading.Lock()
+
+
+def _cookies_dead(key: str) -> bool:
+    with _cookie_lock:
+        return _cookie_state.get(key, {}).get("dead", False)
+
+
+def _cookie_ok(key: str):
+    with _cookie_lock:
+        _cookie_state.setdefault(key, {"fails": 0, "dead": False})["fails"] = 0
+
+
+def _cookie_fail(key: str, reason: str):
+    with _cookie_lock:
+        st = _cookie_state.setdefault(key, {"fails": 0, "dead": False})
+        if st["dead"]:
+            return
+        if reason == "cookies_invalid":
+            st["dead"] = True
+        elif reason in ("bot_check", "auth", "auth_wall"):
+            st["fails"] += 1
+            if st["fails"] >= _COOKIE_MAX_FAILS:
+                st["dead"] = True
+        if st["dead"]:
+            logger.error(
+                f"⚠️ COOKIES DE {key.upper()} MUERTAS (clase={reason}): se omiten "
+                f"el resto de la corrida y el bot sigue en modo anónimo. "
+                f"Re-exporta las cookies y actualiza el secret para recuperarlas."
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Descarga directa
 # ═══════════════════════════════════════════════════════════════════
 
@@ -127,7 +243,13 @@ def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
 # yt-dlp
 # ═══════════════════════════════════════════════════════════════════
 
-def _ytdlp_download(url: str, client: str, cookies: str | None) -> tuple[str | None, dict | None]:
+def _ytdlp_download(url: str, cookies: str | None, client: str | None = None
+                    ) -> tuple[str | None, dict | None, str | None]:
+    """Un intento de descarga de YouTube. client=None deja que yt-dlp elija
+    sus clientes por defecto: los actualiza en cada release (y el pip -U de
+    cada corrida los hereda), y con cookies elige otros distintos que sin
+    cookies — por eso NO se fija una lista de clientes aquí.
+    Devuelve (filepath, info, clase_de_error)."""
     tmp_dir = tempfile.mkdtemp()
     opts = {
         "quiet":               True,
@@ -140,38 +262,67 @@ def _ytdlp_download(url: str, client: str, cookies: str | None) -> tuple[str | N
         # en YouTube: hay que bajar video+audio por separado y unirlos con ffmpeg.
         "format":              "bv*[height<=720]+ba/b[height<=720]/b",
         "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
-        "extractor_args":      {"youtube": {"player_client": [client]}},
     }
+    if client:
+        opts["extractor_args"] = {"youtube": {"player_client": [client]}}
     if PROXY:
         opts["proxy"] = PROXY
     if cookies:
         opts["cookiefile"] = cookies
+    pase = "cookies" if cookies else "anon"
     try:
-        logger.info(f"→ yt-dlp [{client}]...")
+        logger.info(f"[youtube] pase={pase} client={client or 'default'}...")
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             for f in os.listdir(tmp_dir):
                 fp = os.path.join(tmp_dir, f)
                 if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
-                    return fp, info
+                    logger.info(f"[youtube] pase={pase} client={client or 'default'} "
+                                f"→ OK ({os.path.getsize(fp) / 1e6:.1f}MB)")
+                    return fp, info, None
+        return None, None, "no_format"
     except Exception as e:
-        err = str(e)
-        if "DRM" in err or "private" in err.lower():
-            return "PRIVATE", None
-        logger.warning(f"yt-dlp [{client}]: {err[:300]}")
-    return None, None
+        err_class = _classify_dl_error(str(e))
+        logger.warning(f"[youtube] pase={pase} client={client or 'default'} "
+                       f"clase={err_class} err={str(e)[:300]}")
+        return None, None, err_class
 
 
-def _try_ytdlp_all(url: str, cookies: str | None) -> tuple[str | None, dict | None]:
-    # mweb necesita PO Token — lo genera el plugin bgutil-ytdlp-pot-provider
-    # (servidor en 127.0.0.1:4416). tv y web_embedded no requieren PO Token.
-    for client in ["mweb", "tv", "web_embedded"]:
-        fp, info = _ytdlp_download(url, client, cookies)
-        if fp == "PRIVATE":
-            return None, None
+def _try_ytdlp_all(url: str, cookies: str | None
+                   ) -> tuple[str | None, dict | None, str | None]:
+    """Matriz de intentos, del más sostenible al más caro:
+      1. Anónimo con los clientes por defecto de yt-dlp (el PO Token que
+         piden lo genera el plugin bgutil con su servidor en 127.0.0.1:4416).
+      2. Anónimo con web_embedded (los videos embebibles esquivan parte del
+         veto anti-bot de las IPs de datacenter).
+      3. Con cookies (si existen y no están marcadas muertas), clientes por
+         defecto: yt-dlp elige solo la variante con-cookies.
+    El anónimo va PRIMERO a propósito: usar las cookies acelera su rotación
+    (YouTube las vence en días) y unas cookies muertas jamás deben dejar el
+    resultado peor que el anónimo."""
+    reasons = []
+
+    for client in (None, "web_embedded"):
+        fp, info, err = _ytdlp_download(url, None, client)
         if fp:
-            return fp, info
-    return None, None
+            return fp, info, None
+        if err:
+            reasons.append(err)
+            if err in _FATAL_REASONS:
+                return None, None, err
+            if err in _NEEDS_LOGIN:
+                break  # otro pase anónimo no ayuda; ir directo a cookies
+
+    if cookies and not _cookies_dead("youtube"):
+        fp, info, err = _ytdlp_download(url, cookies, None)
+        if fp:
+            _cookie_ok("youtube")
+            return fp, info, None
+        if err:
+            _cookie_fail("youtube", err)
+            reasons.append(err)
+
+    return None, None, _pick_reason(reasons)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -234,7 +385,8 @@ def _redgifs_ytdlp(gif_id: str) -> tuple[str | None, dict | None]:
                         "ext":           os.path.splitext(fp)[1].lstrip("."),
                     }
     except Exception as e:
-        logger.error(f"_redgifs_ytdlp: {str(e)[:200]}")
+        logger.error(f"[redgifs] pase=anon clase={_classify_dl_error(str(e))} "
+                     f"err={str(e)[:200]}")
     return None, None
 
 
@@ -313,7 +465,7 @@ def download_redgifs(url: str) -> tuple[str | None, dict | None]:
             return tmp, info
 
     except Exception as e:
-        logger.error(f"download_redgifs error: {e}")
+        logger.error(f"[redgifs] api-nativa clase={_classify_dl_error(str(e))} err={e}")
 
     # La API nativa falló (token, 401/403, tamaño): probar con yt-dlp
     return _redgifs_ytdlp(gif_id)
@@ -430,38 +582,34 @@ def download_twitter(url: str) -> tuple[str | None, dict | None]:
                         "all_images":  all_images,
                     }
 
-    # ── 3. yt-dlp con cookies ─────────────────────────────────────
+    # ── 3. yt-dlp: con cookies primero (si existen y están vivas); si el
+    #      fallo es de autenticación, se reintenta una vez sin cookies ──
+    #      (fxtwitter, que es anónimo, ya falló arriba: aquí las cookies
+    #      son la vía fuerte, pero muertas no deben bloquear el anónimo).
     logger.info("fxtwitter sin resultado, probando yt-dlp para Twitter...")
     cookies = _cookies("twitter")
-    tmp_dir = tempfile.mkdtemp()
-    opts = {
-        "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
-        "quiet":               True,
-        "no_warnings":         True,
-        "merge_output_format": "mp4",
-        "noplaylist":          True,
-        "socket_timeout":      30,
-        "nocheckcertificate":  True,
-        "format":              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-    }
-    if PROXY:
-        opts["proxy"] = PROXY
-    if cookies:
-        opts["cookiefile"] = cookies
-
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            for f in os.listdir(tmp_dir):
-                fp = os.path.join(tmp_dir, f)
-                if os.path.isfile(fp) and os.path.getsize(fp) > 10_000:
-                    return fp, info
-    except Exception as e:
-        logger.warning(f"download_twitter yt-dlp: {str(e)[:120]}")
+    if cookies and _cookies_dead("twitter"):
+        cookies = None
+    reasons = []
+    for ck in ([cookies, None] if cookies else [None]):
+        fp, info, err = _ytdlp_generic(url, "twitter", ck)
+        if fp:
+            if ck:
+                _cookie_ok("twitter")
+            return fp, info
+        if err:
+            reasons.append(err)
+            if ck:
+                _cookie_fail("twitter", err)
+            if err in _FATAL_REASONS:
+                break
 
     # ── 4. Último recurso: imagen vía todos los métodos disponibles ──
     logger.info("yt-dlp falló, intentando _download_twitter_image...")
-    return _download_twitter_image(url)
+    fp, info = _download_twitter_image(url)
+    if fp:
+        return fp, info
+    raise DownloadBlocked("twitter", _pick_reason(reasons))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -472,7 +620,10 @@ def download_youtube(url: str, platform: str) -> tuple[str | None, dict | None]:
     # yt-dlp directo. Cobalt se quitó de este flujo: sus instancias públicas
     # ya no aceptan peticiones sin API key y solo metían ~2 min de espera.
     cookies = _cookies(platform)
-    return _try_ytdlp_all(url, cookies)
+    fp, info, reason = _try_ytdlp_all(url, cookies)
+    if fp:
+        return fp, info
+    raise DownloadBlocked("youtube", reason or "other")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1076,6 +1227,21 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
     if platform == "redgifs" or "redgifs.com" in url:
         return download_redgifs(url)
 
+    return _ytdlp_generic_matrix(url, platform)
+
+
+# Plataformas donde el intento CON cookies va primero: desde una IP de
+# datacenter el anónimo casi siempre topa con el login wall, así que probar
+# cookies primero ahorra un intento inútil. La garantía se conserva igual:
+# si el pase con cookies falla por autenticación, SIEMPRE se reintenta
+# anónimo (unas cookies muertas nunca dejan el resultado peor que sin ellas).
+_COOKIE_FIRST = {"instagram", "facebook"}
+
+
+def _ytdlp_generic(url: str, platform: str, cookies: str | None
+                   ) -> tuple[str | None, dict | None, str | None]:
+    """Un intento del camino genérico (Instagram/TikTok/Facebook/otros).
+    Devuelve (filepath, info, clase_de_error)."""
     tmp_dir = tempfile.mkdtemp()
     opts = {
         "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
@@ -1089,7 +1255,6 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
     }
     if PROXY:
         opts["proxy"] = PROXY
-    cookies = _cookies(platform)
     if cookies:
         opts["cookiefile"] = cookies
 
@@ -1102,27 +1267,66 @@ def download_media(url: str, platform: str = None) -> tuple[str | None, dict | N
         except Exception:
             pass
 
+    pase = "cookies" if cookies else "anon"
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             for f in os.listdir(tmp_dir):
                 fp = os.path.join(tmp_dir, f)
                 if os.path.isfile(fp):
-                    return fp, info
+                    logger.info(f"[{platform}] pase={pase} → OK")
+                    return fp, info, None
+        return None, None, "no_format"
     except Exception as e:
-        err = str(e)
-        # Twitter: si no hay video, primero intentar URL directa para Telegram
-        if platform == "twitter" and ("No video" in err or "Failed to parse JSON" in err or "403" in err):
-            fp, info = _get_twitter_image_url(url)
-            if fp:
-                return fp, info
-            return _download_twitter_image(url)
-        logger.error(f"download_media error: {e}")
+        err_class = _classify_dl_error(str(e))
+        logger.warning(f"[{platform}] pase={pase} clase={err_class} err={str(e)[:300]}")
+        return None, None, err_class
+
+
+def _ytdlp_generic_matrix(url: str, platform: str) -> tuple[str | None, dict | None]:
+    """Matriz anónimo/cookies del camino genérico + fallbacks históricos.
+    Si todo falla, lanza DownloadBlocked con la razón clasificada."""
+    cookies = _cookies(platform)
+    if cookies and _cookies_dead(platform):
+        cookies = None
+
+    if not cookies:
+        order = [None]
+    elif platform in _COOKIE_FIRST:
+        order = [cookies, None]
+    else:
+        order = [None, cookies]
+
+    reasons = []
+    for ck in order:
+        fp, info, err = _ytdlp_generic(url, platform, ck)
+        if fp:
+            if ck:
+                _cookie_ok(platform)
+            return fp, info
+        if err:
+            reasons.append(err)
+            if ck:
+                _cookie_fail(platform, err)
+            if err in _FATAL_REASONS:
+                break
+
+    # Twitter: si no hay video, intentar la URL directa de la imagen
+    if platform == "twitter":
+        fp, info = _get_twitter_image_url(url)
+        if fp:
+            return fp, info
+        fp, info = _download_twitter_image(url)
+        if fp:
+            return fp, info
 
     # Instagram: yt-dlp solo saca video; para posts de foto probamos el embed
     if platform == "instagram":
-        return _instagram_image_fallback(url)
-    return None, None
+        fp, info = _instagram_image_fallback(url)
+        if fp:
+            return fp, info
+
+    raise DownloadBlocked(platform or "media", _pick_reason(reasons))
 
 
 def _get_twitter_image_url(url: str) -> tuple[str | None, dict | None]:
@@ -1735,7 +1939,11 @@ def download_reddit_post(url: str) -> tuple[str | list[str] | None, dict | None]
                 return fp, {**base_info, "ext": "mp4", "type": "video"}
 
     # ── 5. Intentar con yt-dlp directamente ───────────────────────
-    fp, info = download_media(url, "reddit")
+    # (el flujo Reddit conserva su propio mensaje de error genérico)
+    try:
+        fp, info = download_media(url, "reddit")
+    except DownloadBlocked:
+        fp, info = None, None
     if fp:
         if info:
             info.setdefault("title", title)

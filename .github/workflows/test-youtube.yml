@@ -56,7 +56,15 @@ jobs:
           ]
           fallas = 0
           for url, plataforma in pruebas:
-              fp, info = download_youtube(url, plataforma)
+              # download_youtube ahora LANZA DownloadBlocked con la clase
+              # del fallo (bot_check, cookies_invalid, ...) en vez de
+              # devolver None.
+              try:
+                  fp, info = download_youtube(url, plataforma)
+              except Exception as e:
+                  print(f"FALLO  {url} -> {type(e).__name__}: {e}")
+                  fallas += 1
+                  continue
               if fp and os.path.getsize(fp) > 10_000:
                   mb = os.path.getsize(fp) / (1024 * 1024)
                   print(f"OK  {url} -> {fp} ({mb:.1f} MB) titulo={(info or {}).get('title')!r}")
