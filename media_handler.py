@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import logging
 import subprocess
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
@@ -111,7 +112,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ── Resto de plataformas ───────────────────────────────────
-        file_path, info = download_media(url, platform)
+        # En un hilo aparte: la descarga puede tardar minutos y si corre
+        # en el event loop congela TODO el bot (ni get_updates respira).
+        file_path, info = await asyncio.to_thread(download_media, url, platform)
 
         if not file_path or not info:
             await processing_msg.edit_text(
@@ -164,7 +167,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # respete el aspect ratio y no lo muestre cuadrado o estirado.
         width = height = duration = 0
         if ext not in IMAGE_EXTS and ext != ".gif":
-            width, height, duration = _video_metadata(file_path, info)
+            width, height, duration = await asyncio.to_thread(_video_metadata, file_path, info)
 
         # Reclasificar YouTube por DURACIÓN real: ≤60s = Short, >60s = largo.
         # (youtu.be y watch?v= pueden ser cualquiera de los dos.)
@@ -221,7 +224,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════
 
 async def _handle_reddit(update, processing_msg, url: str):
-    files, info = download_reddit_post(url)
+    files, info = await asyncio.to_thread(download_reddit_post, url)
 
     if not files or not info:
         await processing_msg.edit_text(
@@ -294,7 +297,7 @@ async def _handle_reddit(update, processing_msg, url: str):
 # ═══════════════════════════════════════════════════════════════════
 
 async def _handle_redgifs(update, processing_msg, url: str):
-    file_path, info = download_media(url, "redgifs")
+    file_path, info = await asyncio.to_thread(download_media, url, "redgifs")
 
     if not file_path or not info:
         await processing_msg.edit_text(
@@ -320,7 +323,7 @@ async def _handle_redgifs(update, processing_msg, url: str):
 # ═══════════════════════════════════════════════════════════════════
 
 async def _handle_facebook_ads(update, processing_msg, url: str):
-    files, info = download_facebook_ads(url)
+    files, info = await asyncio.to_thread(download_facebook_ads, url)
 
     if not files or not info:
         await processing_msg.edit_text(
@@ -372,7 +375,7 @@ async def _handle_facebook_ads(update, processing_msg, url: str):
 
         width = height = duration = 0
         if ext not in IMAGE_EXTS and ext != ".gif":
-            width, height, duration = _video_metadata(fp, info)
+            width, height, duration = await asyncio.to_thread(_video_metadata, fp, info)
 
         await _send_single_file(
             update, fp, ext, file_size_mb, caption_text,
@@ -409,7 +412,7 @@ async def _send_single_file(update, file_path: str, ext: str, size_mb: float, ca
     else:
         # Asegurar dimensiones para que Telegram respete el aspect ratio.
         if not (width and height):
-            w, h, d = _ffprobe(file_path)
+            w, h, d = await asyncio.to_thread(_ffprobe, file_path)
             width    = width or w
             height   = height or h
             duration = duration or d
@@ -445,7 +448,7 @@ def _extract_audio(video_path: str) -> str | None:
 async def _send_audio(update, video_path: str, info: dict):
     """Extrae el audio del video ya descargado y lo envía como archivo de audio.
     Silencioso ante fallos: el video ya se envió, el audio es solo un extra."""
-    audio_path = _extract_audio(video_path)
+    audio_path = await asyncio.to_thread(_extract_audio, video_path)
     if not audio_path:
         return
     try:
