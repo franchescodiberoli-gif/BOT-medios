@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import time
+import shutil
 import tempfile
 import threading
 import logging
@@ -222,9 +223,16 @@ def _cookie_fail(key: str, reason: str):
 # Descarga directa
 # ═══════════════════════════════════════════════════════════════════
 
+def _discard_tmp(tmp_dir: str):
+    """Borra el directorio temporal de un intento fallido. El proceso corre
+    horas y los restos parciales de yt-dlp van llenando el disco del runner."""
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
+    tmp_dir = tempfile.mkdtemp()
     try:
-        tmp = os.path.join(tempfile.mkdtemp(), f"video.{ext}")
+        tmp = os.path.join(tmp_dir, f"video.{ext}")
         hdrs = {"User-Agent": "Mozilla/5.0 (compatible; MediaBot/2.0)"}
         with requests.get(url, headers=hdrs, stream=True, timeout=120,
                           proxies=PROXIES, verify=False) as r:
@@ -236,6 +244,7 @@ def _download_direct_url(url: str, ext: str = "mp4") -> str | None:
             return tmp
     except Exception as e:
         logger.warning(f"_download_direct_url: {e}")
+    _discard_tmp(tmp_dir)
     return None
 
 
@@ -260,7 +269,12 @@ def _ytdlp_download(url: str, cookies: str | None, client: str | None = None
         "nocheckcertificate":  True,
         # Los formatos progresivos ("best" en un solo archivo) casi ya no existen
         # en YouTube: hay que bajar video+audio por separado y unirlos con ffmpeg.
-        "format":              "bv*[height<=720]+ba/b[height<=720]/b",
+        # Preferimos un formato que quepa en el límite de 50MB de Telegram
+        # (40M video + 8M audio); si ninguno declara tamaño o no cabe, caemos
+        # a la cadena de siempre y media_handler avisa que pesa demasiado.
+        "format":              ("bv*[height<=720][filesize<40M]+ba[filesize<8M]/"
+                                "bv*[height<=720][filesize_approx<40M]+ba[filesize_approx<8M]/"
+                                "bv*[height<=720]+ba/b[height<=720]/b"),
         "outtmpl":             os.path.join(tmp_dir, "%(id)s.%(ext)s"),
     }
     if client:
@@ -280,8 +294,10 @@ def _ytdlp_download(url: str, cookies: str | None, client: str | None = None
                     logger.info(f"[youtube] pase={pase} client={client or 'default'} "
                                 f"→ OK ({os.path.getsize(fp) / 1e6:.1f}MB)")
                     return fp, info, None
+        _discard_tmp(tmp_dir)
         return None, None, "no_format"
     except Exception as e:
+        _discard_tmp(tmp_dir)
         err_class = _classify_dl_error(str(e))
         logger.warning(f"[youtube] pase={pase} client={client or 'default'} "
                        f"clase={err_class} err={str(e)[:300]}")
@@ -387,6 +403,7 @@ def _redgifs_ytdlp(gif_id: str) -> tuple[str | None, dict | None]:
     except Exception as e:
         logger.error(f"[redgifs] pase=anon clase={_classify_dl_error(str(e))} "
                      f"err={str(e)[:200]}")
+    _discard_tmp(tmp_dir)
     return None, None
 
 
@@ -443,7 +460,8 @@ def download_redgifs(url: str) -> tuple[str | None, dict | None]:
 
         ext = "mp4" if ".mp4" in video_url else "gif"
         dl_headers = {**api_headers, "Accept": "*/*"}
-        tmp = os.path.join(tempfile.mkdtemp(), f"redgifs.{ext}")
+        tmp_dir = tempfile.mkdtemp()
+        tmp = os.path.join(tmp_dir, f"redgifs.{ext}")
         with session.get(video_url, headers=dl_headers, stream=True,
                          timeout=120, proxies=PROXIES, verify=False) as rv:
             rv.raise_for_status()
@@ -463,6 +481,7 @@ def download_redgifs(url: str) -> tuple[str | None, dict | None]:
                 "ext":           ext,
             }
             return tmp, info
+        _discard_tmp(tmp_dir)
 
     except Exception as e:
         logger.error(f"[redgifs] api-nativa clase={_classify_dl_error(str(e))} err={e}")
@@ -748,8 +767,9 @@ def _fb_unescape(u: str) -> str:
 
 def _fb_download(cookies: dict, url: str, ext: str = "mp4") -> str | None:
     """Descarga un recurso (video/imagen) del CDN de Facebook."""
+    tmp_dir = tempfile.mkdtemp()
     try:
-        tmp = os.path.join(tempfile.mkdtemp(), f"fbad.{ext}")
+        tmp = os.path.join(tmp_dir, f"fbad.{ext}")
         hdrs = {
             "User-Agent": _fb_headers()["User-Agent"],
             "Accept": "*/*",
@@ -781,6 +801,7 @@ def _fb_download(cookies: dict, url: str, ext: str = "mp4") -> str | None:
             return tmp
     except Exception as e:
         logger.warning(f"_fb_download: {e}")
+    _discard_tmp(tmp_dir)
     return None
 
 
@@ -1018,6 +1039,7 @@ def _try_fb_ads_ytdlp(ad_id: str, cookies: str | None) -> tuple[str | None, dict
                     return fp, info
     except Exception as e:
         logger.warning(f"_try_fb_ads_ytdlp: {str(e)[:140]}")
+    _discard_tmp(tmp_dir)
     return None, None
 
 
@@ -1276,8 +1298,10 @@ def _ytdlp_generic(url: str, platform: str, cookies: str | None
                 if os.path.isfile(fp):
                     logger.info(f"[{platform}] pase={pase} → OK")
                     return fp, info, None
+        _discard_tmp(tmp_dir)
         return None, None, "no_format"
     except Exception as e:
+        _discard_tmp(tmp_dir)
         err_class = _classify_dl_error(str(e))
         logger.warning(f"[{platform}] pase={pase} clase={err_class} err={str(e)[:300]}")
         return None, None, err_class
@@ -1498,6 +1522,7 @@ def _download_twitter_image(url: str) -> tuple[str | None, dict | None]:
                 if "description" not in result_info:
                     result_info["description"] = result_info.get("title", "")
                 return fpath, result_info
+        _discard_tmp(tmp_dir)
 
     except Exception as e:
         logger.warning(f"_download_twitter_image (writethumbnail): {e}")
@@ -1781,22 +1806,25 @@ def _download_vreddit(video_id: str) -> tuple[str | None, dict | None]:
                     }
     except Exception as e:
         logger.warning(f"_download_vreddit: {str(e)[:200]}")
+    _discard_tmp(tmp_dir)
     return None, None
 
 
 def _dl_image(img_url: str, ext: str = "jpg") -> str | None:
     """Descarga una imagen/gif a un archivo temporal."""
+    tmp_dir = tempfile.mkdtemp()
     try:
         r = requests.get(img_url, headers=_HEADERS, proxies=PROXIES,
                          timeout=30, verify=False)
         r.raise_for_status()
-        tmp = os.path.join(tempfile.mkdtemp(), f"reddit.{ext}")
+        tmp = os.path.join(tmp_dir, f"reddit.{ext}")
         with open(tmp, "wb") as f:
             f.write(r.content)
         if os.path.getsize(tmp) > 1000:
             return tmp
     except Exception as e:
         logger.warning(f"_dl_image: {e}")
+    _discard_tmp(tmp_dir)
     return None
 
 

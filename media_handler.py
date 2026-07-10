@@ -1,7 +1,9 @@
 import os
 import json
+import shutil
 import asyncio
 import logging
+import tempfile
 import subprocess
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from telegram.ext import ContextTypes
@@ -360,9 +362,14 @@ async def _handle_facebook_ads(update, processing_msg, url: str):
                 await update.message.reply_media_group(media=media_group)
             except BadRequest:
                 # Reintento sin Markdown si el caption tiene entidades inválidas
-                plain = [InputMediaPhoto(media=open(fp, "rb").read(),
-                                         caption=(caption_text if i == 0 else None))
-                         for i, fp in enumerate(files[:10])]
+                # (con with para no fugar file handles, y caption truncado
+                # para no re-disparar el BadRequest por longitud)
+                plain = []
+                for i, fp in enumerate(files[:10]):
+                    with open(fp, "rb") as f:
+                        plain.append(InputMediaPhoto(
+                            media=f.read(),
+                            caption=(caption_text[:CAPTION_LIMIT] if i == 0 else None)))
                 await update.message.reply_media_group(media=plain)
             if overflow:
                 await _send_long_text(update, overflow)
@@ -404,8 +411,9 @@ async def _send_single_file(update, file_path: str, ext: str, size_mb: float, ca
     elif size_mb > MAX_FILE_SIZE_MB:
         # No se puede enviar el archivo: avisamos y mandamos el caption como texto.
         warn = (
-            f"⚠️ El archivo pesa {size_mb:.1f}MB (máx {MAX_FILE_SIZE_MB}MB), "
-            f"no puedo enviarlo directamente.\n\n{caption}"
+            f"⚠️ El archivo pesa {size_mb:.1f}MB y el límite de Telegram para "
+            f"bots es {MAX_FILE_SIZE_MB}MB, no puedo enviarlo directamente "
+            f"(ya intenté buscar un formato que cupiera).\n\n{caption}"
         )
         await _send_long_text(update, warn)
         return
@@ -550,15 +558,29 @@ async def _send_long_text(update, text: str):
             await update.message.reply_text(chunk, disable_web_page_preview=False)
 
 
+_TMP_ROOT = os.path.realpath(tempfile.gettempdir())
+
+
+def _remove_file_and_tmpdir(fp):
+    """Borra el archivo Y su directorio mkdtemp padre. El guard (dir tmp*
+    directamente bajo /tmp) evita tocar /tmp mismo o los archivos de
+    cookies (/tmp/*_cookies.txt), que viven sueltos en /tmp."""
+    try:
+        os.remove(fp)
+    except Exception:
+        pass
+    try:
+        parent = os.path.realpath(os.path.dirname(fp))
+        if (os.path.dirname(parent) == _TMP_ROOT
+                and os.path.basename(parent).startswith("tmp")):
+            shutil.rmtree(parent, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def _cleanup(files):
     if isinstance(files, list):
         for fp in files:
-            try:
-                os.remove(fp)
-            except Exception:
-                pass
+            _remove_file_and_tmpdir(fp)
     elif files:
-        try:
-            os.remove(files)
-        except Exception:
-            pass
+        _remove_file_and_tmpdir(files)
