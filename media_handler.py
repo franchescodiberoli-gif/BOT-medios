@@ -62,6 +62,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         processing_msg = await update.message.reply_text("⏳ Descargando contenido...")
 
+    file_path = None
     try:
         # ── Reddit: flujo especial ─────────────────────────────────
         if platform == "reddit":
@@ -112,8 +113,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_media_group(media=plain)
             if overflow:
                 await _send_long_text(update, overflow)
-            if isinstance(file_path, str) and not file_path.startswith("URL:"):
-                _cleanup(file_path)
             return
 
         # Twitter imagen: file_path puede ser "URL:https://..." para envío directo
@@ -153,9 +152,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if platform in AUDIO_PLATFORMS and ext not in IMAGE_EXTS and ext != ".gif":
             await _send_audio(update, file_path, info)
 
-        # Borrar el temporal: el proceso corre horas y sin esto se llena el disco
-        _cleanup(file_path)
-
     except Exception as e:
         logger.error(f"Error procesando {url}: {e}")
         # processing_msg pudo haber sido borrado ya (p.ej. tras delete()),
@@ -171,6 +167,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(err_text)
             except Exception:
                 pass
+    finally:
+        # Borrar el temporal pase lo que pase (también si el ENVÍO falló):
+        # el proceso corre horas y los archivos huérfanos llenan el disco.
+        if file_path and not (isinstance(file_path, str) and file_path.startswith("URL:")):
+            _cleanup(file_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -187,61 +188,63 @@ async def _handle_reddit(update, processing_msg, url: str):
         )
         return
 
-    await processing_msg.delete()
+    # La limpieza va en finally: si el envío falla, el archivo huérfano
+    # se acumula en el disco del runner durante toda la corrida.
+    try:
+        await processing_msg.delete()
 
-    post_type = info.get("type", "")
-    title     = info.get("title", "Reddit post")
-    post_url  = info.get("webpage_url", url)
+        post_type = info.get("type", "")
+        title     = info.get("title", "Reddit post")
+        post_url  = info.get("webpage_url", url)
 
-    # ── Redgif embebido en post de Reddit ─────────────────────────
-    if post_type == "redgif_in_reddit":
-        redgif_url = info.get("redgif_url", post_url)
-        caption    = format_message("redgif_in_reddit", info, redgif_url)
-        ext = os.path.splitext(files)[1].lower() if isinstance(files, str) else ".mp4"
-        file_size_mb = os.path.getsize(files) / (1024 * 1024) if isinstance(files, str) else 0
-        await _send_single_file(update, files, ext, file_size_mb, caption)
+        # ── Redgif embebido en post de Reddit ─────────────────────────
+        if post_type == "redgif_in_reddit":
+            redgif_url = info.get("redgif_url", post_url)
+            caption    = format_message("redgif_in_reddit", info, redgif_url)
+            ext = os.path.splitext(files)[1].lower() if isinstance(files, str) else ".mp4"
+            file_size_mb = os.path.getsize(files) / (1024 * 1024) if isinstance(files, str) else 0
+            await _send_single_file(update, files, ext, file_size_mb, caption)
+            return
+
+        # ── Galería ────────────────────────────────────────────────────
+        if isinstance(files, list) and len(files) > 1:
+            count   = len(files)
+            # Caption SIN Markdown: los títulos de Reddit traen *, _ y [ que
+            # rompen el parseo de Telegram y tumbaban el álbum completo.
+            caption = (
+                f"👽 Reddit · 🖼️ Galería ({count} fotos)\n\n"
+                f"📌 {title}\n\n"
+                f"🔗 {post_url}"
+            )[:CAPTION_LIMIT]
+            # sendMediaGroup no acepta animaciones: los .gif/.mp4 van aparte.
+            # Telegram acepta hasta 10 items por media group.
+            media_group, animated = [], []
+            for fp in files[:10]:
+                ext = os.path.splitext(fp)[1].lower()
+                if ext in (".gif", ".mp4"):
+                    animated.append(fp)
+                    continue
+                with open(fp, "rb") as f:
+                    data = f.read()
+                media_group.append(
+                    InputMediaPhoto(media=data, caption=(caption if not media_group else None))
+                )
+            if media_group:
+                await update.message.reply_media_group(media=media_group)
+            for j, fp in enumerate(animated):
+                cap = caption if (not media_group and j == 0) else None
+                with open(fp, "rb") as f:
+                    await update.message.reply_animation(animation=f, caption=cap)
+            return
+
+        # ── Archivo único ─────────────────────────────────────────────
+        fp = files[0] if isinstance(files, list) else files
+        ext = os.path.splitext(fp)[1].lower()
+        file_size_mb = os.path.getsize(fp) / (1024 * 1024)
+        caption = format_message("reddit", info, post_url)
+        await _send_single_file(update, fp, ext, file_size_mb, caption)
+    finally:
         _cleanup(files)
-        return
-
-    # ── Galería ────────────────────────────────────────────────────
-    if isinstance(files, list) and len(files) > 1:
-        count   = len(files)
-        # Caption SIN Markdown: los títulos de Reddit traen *, _ y [ que
-        # rompen el parseo de Telegram y tumbaban el álbum completo.
-        caption = (
-            f"👽 Reddit · 🖼️ Galería ({count} fotos)\n\n"
-            f"📌 {title}\n\n"
-            f"🔗 {post_url}"
-        )[:CAPTION_LIMIT]
-        # sendMediaGroup no acepta animaciones: los .gif/.mp4 van aparte.
-        # Telegram acepta hasta 10 items por media group.
-        media_group, animated = [], []
-        for fp in files[:10]:
-            ext = os.path.splitext(fp)[1].lower()
-            if ext in (".gif", ".mp4"):
-                animated.append(fp)
-                continue
-            with open(fp, "rb") as f:
-                data = f.read()
-            media_group.append(
-                InputMediaPhoto(media=data, caption=(caption if not media_group else None))
-            )
-        if media_group:
-            await update.message.reply_media_group(media=media_group)
-        for j, fp in enumerate(animated):
-            cap = caption if (not media_group and j == 0) else None
-            with open(fp, "rb") as f:
-                await update.message.reply_animation(animation=f, caption=cap)
-        _cleanup(files)
-        return
-
-    # ── Archivo único ─────────────────────────────────────────────
-    fp = files[0] if isinstance(files, list) else files
-    ext = os.path.splitext(fp)[1].lower()
-    file_size_mb = os.path.getsize(fp) / (1024 * 1024)
-    caption = format_message("reddit", info, post_url)
-    await _send_single_file(update, fp, ext, file_size_mb, caption)
-    _cleanup(fp)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -258,14 +261,16 @@ async def _handle_redgifs(update, processing_msg, url: str):
         )
         return
 
-    await processing_msg.delete()
+    try:
+        await processing_msg.delete()
 
-    clean_url    = get_clean_url(info)
-    caption_text = format_message("redgifs", info, clean_url or url)
-    ext          = os.path.splitext(file_path)[1].lower()
-    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-    await _send_single_file(update, file_path, ext, file_size_mb, caption_text)
-    _cleanup(file_path)
+        clean_url    = get_clean_url(info)
+        caption_text = format_message("redgifs", info, clean_url or url)
+        ext          = os.path.splitext(file_path)[1].lower()
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        await _send_single_file(update, file_path, ext, file_size_mb, caption_text)
+    finally:
+        _cleanup(file_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -288,50 +293,51 @@ async def _handle_facebook_ads(update, processing_msg, url: str):
         )
         return
 
-    await processing_msg.delete()
+    try:
+        await processing_msg.delete()
 
-    ad_id     = info.get("id", "")
-    clean_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
-    caption_text = format_message("facebook_ads", info, clean_url)
+        ad_id     = info.get("id", "")
+        clean_url = f"https://www.facebook.com/ads/library/?id={ad_id}"
+        caption_text = format_message("facebook_ads", info, clean_url)
 
-    # ── Carrusel de imágenes (varias fotos) ───────────────────────────
-    if isinstance(files, list) and len(files) > 1:
-        media_caption, overflow = _split_caption(caption_text)
-        media_group = []
-        for i, fp in enumerate(files[:10]):
-            cap = media_caption if i == 0 else None
-            with open(fp, "rb") as f:
-                data = f.read()
-            media_group.append(
-                InputMediaPhoto(media=data, caption=cap, parse_mode="Markdown")
-            )
-        try:
-            await update.message.reply_media_group(media=media_group)
-        except BadRequest:
-            # Reintento sin Markdown si el caption tiene entidades inválidas
-            plain = [InputMediaPhoto(media=open(fp, "rb").read(),
-                                     caption=(caption_text if i == 0 else None))
-                     for i, fp in enumerate(files[:10])]
-            await update.message.reply_media_group(media=plain)
-        if overflow:
-            await _send_long_text(update, overflow)
+        # ── Carrusel de imágenes (varias fotos) ───────────────────────────
+        if isinstance(files, list) and len(files) > 1:
+            media_caption, overflow = _split_caption(caption_text)
+            media_group = []
+            for i, fp in enumerate(files[:10]):
+                cap = media_caption if i == 0 else None
+                with open(fp, "rb") as f:
+                    data = f.read()
+                media_group.append(
+                    InputMediaPhoto(media=data, caption=cap, parse_mode="Markdown")
+                )
+            try:
+                await update.message.reply_media_group(media=media_group)
+            except BadRequest:
+                # Reintento sin Markdown si el caption tiene entidades inválidas
+                plain = [InputMediaPhoto(media=open(fp, "rb").read(),
+                                         caption=(caption_text if i == 0 else None))
+                         for i, fp in enumerate(files[:10])]
+                await update.message.reply_media_group(media=plain)
+            if overflow:
+                await _send_long_text(update, overflow)
+            return
+
+        # ── Archivo único (1 video o 1 imagen) ────────────────────────────
+        fp = files[0] if isinstance(files, list) else files
+        ext          = os.path.splitext(fp)[1].lower()
+        file_size_mb = os.path.getsize(fp) / (1024 * 1024)
+
+        width = height = duration = 0
+        if ext not in IMAGE_EXTS and ext != ".gif":
+            width, height, duration = _video_metadata(fp, info)
+
+        await _send_single_file(
+            update, fp, ext, file_size_mb, caption_text,
+            width=width, height=height, duration=duration,
+        )
+    finally:
         _cleanup(files)
-        return
-
-    # ── Archivo único (1 video o 1 imagen) ────────────────────────────
-    fp = files[0] if isinstance(files, list) else files
-    ext          = os.path.splitext(fp)[1].lower()
-    file_size_mb = os.path.getsize(fp) / (1024 * 1024)
-
-    width = height = duration = 0
-    if ext not in IMAGE_EXTS and ext != ".gif":
-        width, height, duration = _video_metadata(fp, info)
-
-    await _send_single_file(
-        update, fp, ext, file_size_mb, caption_text,
-        width=width, height=height, duration=duration,
-    )
-    _cleanup(fp)
 
 
 # ═══════════════════════════════════════════════════════════════════
