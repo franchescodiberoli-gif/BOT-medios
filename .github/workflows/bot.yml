@@ -53,11 +53,17 @@ jobs:
 
       - name: Instalar dependencias
         run: |
+          # ffmpeg venía en packages.txt (apt de Streamlit Cloud); el runner de
+          # GitHub ya no lo trae. Sin él yt-dlp no puede unir video+audio
+          # (YouTube/Reddit) ni el bot extraer el mp3.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
           pip install -U -r requirements.txt
           pip install -U "yt-dlp[default]" bgutil-ytdlp-pot-provider
           # Chromium para el fallback de Facebook Ads (si no, se re-descargan
-          # ~170MB en runtime la primera vez que alguien manda un anuncio)
-          python -m playwright install chromium
+          # ~170MB en runtime la primera vez que alguien manda un anuncio).
+          # --with-deps instala también las libs de sistema (libnspr4, libnss3).
+          python -m playwright install --with-deps chromium
 
       - name: Correr bot (5.5 horas)
         env:
