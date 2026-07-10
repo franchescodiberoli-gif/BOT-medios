@@ -37,6 +37,10 @@ jobs:
           pip install -U "yt-dlp[default]" bgutil-ytdlp-pot-provider requests PySocks curl_cffi
 
       - name: Descargar videos de prueba
+        env:
+          # Mismas cookies que usa el bot: sin ellas YouTube veta muchos
+          # videos desde IPs de datacenter ("Sign in to confirm...").
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           python - <<'EOF'
           import logging, os
