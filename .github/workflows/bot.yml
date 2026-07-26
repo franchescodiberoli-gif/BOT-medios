@@ -85,7 +85,8 @@ jobs:
           FB_PROXY_URL:       ${{ secrets.FB_PROXY_URL }}
         run: |
           START=$(date +%s)
-          timeout --signal=SIGINT 19800 python bot.py; EXIT=$?
+          EXIT=0
+          timeout --signal=SIGINT 19800 python bot.py || EXIT=$?
           ELAPSED=$(( $(date +%s) - START ))
           echo "bot.py terminó con código $EXIT tras ${ELAPSED}s"
           # Si murió en menos de 5 min es un error de arranque: NO relanzar en
