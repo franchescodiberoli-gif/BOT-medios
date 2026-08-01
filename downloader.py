@@ -40,6 +40,27 @@ REDDIT_UA            = "script:mediabot:2.0 (bot personal de Telegram)"
 PROXY   = os.environ.get("PROXY_URL", "")
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else {}
 
+# Plataformas que van SIN proxy aunque PROXY_URL esté puesto.
+# TikTok es el caso probado (2026-08-01): desde la IP de GitHub baja perfecto,
+# pero a la IP del proxy residencial le sirve una página distinta y yt-dlp
+# revienta con "Unable to extract universal data for rehydration". Como TikTok
+# nunca necesitó el proxy, se le manda directo y así no perdemos una que ya
+# funcionaba por arreglar otra.
+# Ajustable sin tocar código con la variable PROXY_SKIP (lista con comas);
+# poner PROXY_SKIP vacío hace que TODO pase por el proxy.
+PROXY_SKIP = {
+    p.strip().lower()
+    for p in os.environ.get("PROXY_SKIP", "tiktok").split(",")
+    if p.strip()
+}
+
+
+def _proxy_for(platform: str | None) -> str:
+    """Proxy que le toca a esta plataforma ("" = conexión directa)."""
+    if platform and platform.lower() in PROXY_SKIP:
+        return ""
+    return PROXY
+
 _PATHS = {
     "instagram": "/tmp/ig_cookies.txt",
     "youtube":   "/tmp/yt_cookies.txt",
@@ -1295,8 +1316,9 @@ def _ytdlp_generic(url: str, platform: str, cookies: str | None
         "nocheckcertificate":  True,
         "format":              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
     }
-    if PROXY:
-        opts["proxy"] = PROXY
+    _prox = _proxy_for(platform)
+    if _prox:
+        opts["proxy"] = _prox
     if cookies:
         opts["cookiefile"] = cookies
 
