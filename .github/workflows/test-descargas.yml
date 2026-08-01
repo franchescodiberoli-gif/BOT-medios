@@ -36,7 +36,7 @@ jobs:
           # separados y sin ffmpeg la fusión aborta.
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          pip install -U "yt-dlp[default]" bgutil-ytdlp-pot-provider requests PySocks curl_cffi
+          pip install -U "yt-dlp[default]" bgutil-ytdlp-pot-provider yt-dlp-invidious requests PySocks curl_cffi
 
       - name: Descargar contenido de prueba por plataforma
         env:
