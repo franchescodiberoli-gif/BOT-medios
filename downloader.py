@@ -3,8 +3,6 @@ import os
 import re
 import sys
 import time
-import random
-import string
 import shutil
 import tempfile
 import threading
@@ -31,14 +29,13 @@ REDDIT_CLIENT_ID     = os.environ.get("REDDIT_CLIENT_ID",     "")
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
 REDDIT_UA            = "script:mediabot:2.0 (bot personal de Telegram)"
 
-# Token anónimo SIN registrar ninguna app: se pide el grant "installed_client"
-# que la app oficial de Android usa la primera vez que se abre. Técnica tomada
-# de redlib-org/redlib (src/oauth.rs), que la usa en producción desde 2024.
-# Sirve solo para leer contenido público, igual que el .json anónimo, pero no
-# lo bloquean desde IPs de datacenter.
-_REDDIT_INSTALLED_AUTH = "Basic M1hmQkpXbGlIdnFBQ25YcmZJWWxMdzo="
-_REDDIT_ANDROID_UA     = "Reddit/Version 2024.22.1/Build 1671774/Android 13"
-_reddit_anon           = {"value": None, "exp": 0}
+# PROBADO Y DESCARTADO (2026-08-01): el truco de redlib de pedir el grant
+# "installed_client" haciéndose pasar por la app de Android — para no tener que
+# registrar app — devuelve 401 Unauthorized. El client_id que publica redlib ya
+# no lo acepta Reddit. Si alguien lo reintenta: sacar el client_id VIGENTE del
+# oauth.rs de redlib y probarlo aislado ANTES de cablearlo aquí; no asumir que
+# sigue sirviendo. Mientras tanto, la única vía confiable desde una IP de
+# datacenter son REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET.
 
 PROXY   = os.environ.get("PROXY_URL", "")
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else {}
@@ -1181,67 +1178,19 @@ def download_threads(url: str) -> tuple[str | None, dict | None]:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Instagram  ──  espejos "fix" (gratis, sin login) + fallback de embed
+# Instagram  ──  fallback de fotos vía página de embed
 # ═══════════════════════════════════════════════════════════════════
 
-# Espejos del proyecto InstaFix (Wikidepia/InstaFix) y sus clones. El prefijo
-# "d." devuelve el archivo directo, sin página. Es el MISMO truco que ya nos
-# funciona en Twitter con fxtwitter: gratis, sin cuenta, sin cookies.
-# Son varios porque estos servicios se caen y se rebautizan seguido; el bot
-# prueba en orden y se queda con el primero que conteste.
-_INSTAFIX_HOSTS = (
-    "d.ddinstagram.com",
-    "d.kkinstagram.com",
-    "d.instagramez.com",
-)
-
-
-def _instagram_instafix(url: str) -> tuple[str | None, dict | None]:
-    """Baja foto O video de Instagram por un espejo público estilo fxtwitter.
-
-    A diferencia del fallback de embed (que solo saca fotos), esto sirve para
-    reels también, y no depende de cookies ni de que yt-dlp pase el login wall."""
-    m = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url)
-    if not m:
-        return None, None
-    shortcode = m.group(1)
-
-    for host in _INSTAFIX_HOSTS:
-        mirror = f"https://{host}/p/{shortcode}"
-        try:
-            r = requests.get(mirror, headers=_HEADERS, proxies=PROXIES,
-                             timeout=30, allow_redirects=True, stream=True,
-                             verify=False)
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            if r.status_code != 200 or not ctype.startswith(("video/", "image/")):
-                logger.info(f"[instagram] espejo {host} → {r.status_code} {ctype[:40]}")
-                r.close()
-                continue
-
-            ext = "mp4" if ctype.startswith("video/") else "jpg"
-            fd, path = tempfile.mkstemp(suffix=f".{ext}")
-            size = 0
-            with os.fdopen(fd, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1 << 16):
-                    if chunk:
-                        f.write(chunk)
-                        size += len(chunk)
-            r.close()
-
-            if size < 10_000:
-                os.remove(path)
-                logger.info(f"[instagram] espejo {host} devolvió {size}B — descartado")
-                continue
-
-            logger.info(f"[instagram] espejo {host} → OK ({size / 1e6:.1f}MB, {ext})")
-            return path, {
-                "id": shortcode, "title": "Instagram", "description": "",
-                "webpage_url": f"https://www.instagram.com/p/{shortcode}/",
-                "extractor_key": "Instagram", "ext": ext,
-            }
-        except Exception as e:
-            logger.info(f"[instagram] espejo {host} falló: {str(e)[:120]}")
-    return None, None
+# PROBADO Y DESCARTADO (2026-08-01): los espejos públicos estilo fxtwitter para
+# Instagram (InstaFix y clones) están muertos. Verificado uno por uno:
+#   d.ddinstagram.com, d.kkinstagram.com, d.instagramfix.com → el dominio ya no
+#     resuelve; el proyecto se apagó.
+#   d.instagramez.com → PELIGRO: el dominio lo agarró un tercero y ahora
+#     redirige a una red de anuncios (effectivegatecpm.com). No usarlo.
+#   d.vxinstagram.com → vivo, pero devuelve HTML, no el archivo directo.
+# Si algún día alguien quiere reintentarlo: probar el host AISLADO y confirmar
+# que el Content-Type sea video/* o image/* antes de cablearlo. El fallback de
+# embed de aquí abajo sigue siendo el que funciona.
 
 
 def _instagram_image_fallback(url: str) -> tuple[str | None, dict | None]:
@@ -1415,13 +1364,8 @@ def _ytdlp_generic_matrix(url: str, platform: str) -> tuple[str | None, dict | N
         if fp:
             return fp, info
 
-    # Instagram: si yt-dlp no pudo (login wall desde IP de datacenter), probar
-    # los espejos públicos — sirven para foto Y video, y no piden cookies.
-    # Si tampoco, queda el embed, que solo saca fotos.
+    # Instagram: yt-dlp solo saca video; para posts de foto probamos el embed
     if platform == "instagram":
-        fp, info = _instagram_instafix(url)
-        if fp:
-            return fp, info
         fp, info = _instagram_image_fallback(url)
         if fp:
             return fp, info
@@ -1775,48 +1719,6 @@ def _reddit_oauth_token() -> str | None:
     return None
 
 
-def _reddit_anon_token() -> str | None:
-    """Token anónimo de "cliente instalado", sin app registrada ni cuenta.
-
-    Es el mismo grant que pide la app oficial de Android al abrirse por primera
-    vez: da acceso de solo-lectura al contenido público, que es todo lo que el
-    bot necesita. A diferencia del .json anónimo, Reddit no lo bloquea desde
-    IPs de datacenter. Se renueva solo 2 min antes de vencer."""
-    if _reddit_anon["value"] and time.time() < _reddit_anon["exp"]:
-        return _reddit_anon["value"]
-
-    device_id = "".join(random.choices(string.ascii_letters + string.digits, k=20))
-    try:
-        r = requests.post(
-            "https://www.reddit.com/api/v1/access_token",
-            data={
-                "grant_type": "https://oauth.reddit.com/grants/installed_client",
-                "device_id":  device_id,
-            },
-            headers={
-                "Authorization":        _REDDIT_INSTALLED_AUTH,
-                "User-Agent":           _REDDIT_ANDROID_UA,
-                "Content-Type":         "application/x-www-form-urlencoded",
-                "x-reddit-device-id":   device_id,
-                "x-reddit-compression": "1",
-                "x-reddit-retry":       "algo=no-retries",
-            },
-            proxies=PROXIES, timeout=20,
-        )
-        r.raise_for_status()
-        j   = r.json()
-        tok = j.get("access_token")
-        if tok:
-            _reddit_anon["value"] = tok
-            _reddit_anon["exp"]   = time.time() + int(j.get("expires_in", 3600)) - 120
-            logger.info("[reddit] token anónimo OK (sin app registrada)")
-            return tok
-        logger.warning(f"_reddit_anon_token: respuesta sin access_token: {str(j)[:200]}")
-    except Exception as e:
-        logger.warning(f"_reddit_anon_token: {e}")
-    return None
-
-
 def _reddit_api_get(post_id: str, token: str, ua: str) -> dict | None:
     """Pide un post a oauth.reddit.com con el token que sea (oficial o anónimo)."""
     r = requests.get(
@@ -1867,20 +1769,7 @@ def _fetch_post_json(url: str) -> dict | None:
             except Exception as e:
                 logger.warning(f"_fetch_post_json oauth app: {e}")
 
-    # 2) Token anónimo de cliente instalado (técnica de redlib). No necesita
-    #    app registrada y pasa donde el .json anónimo recibe 403.
-    if post_id:
-        anon = _reddit_anon_token()
-        if anon:
-            try:
-                return _reddit_api_get(post_id, anon, _REDDIT_ANDROID_UA)
-            except Exception as e:
-                logger.warning(f"_fetch_post_json anon: {e}")
-                # Un token vencido o revocado no debe reusarse en el próximo link
-                _reddit_anon["value"] = None
-                _reddit_anon["exp"]   = 0
-
-    # 3) .json público — Reddit lo bloquea (403) desde muchas IPs de
+    # 2) .json público — Reddit lo bloquea (403) desde muchas IPs de
     #    datacenter; con huella de Chrome real a veces pasa.
     try:
         if _HAS_CFFI:
@@ -1895,12 +1784,11 @@ def _fetch_post_json(url: str) -> dict | None:
         return data[0]["data"]["children"][0]["data"]
     except Exception as e:
         logger.error(
-            f"_fetch_post_json error: {e} — fallaron los 3 caminos (app oficial, "
-            "token anónimo de cliente instalado, .json público). Si el token "
-            "anónimo empezó a fallar seguido, Reddit cambió el grant: revisar "
-            "cómo lo hace redlib-org/redlib hoy, o configurar los secrets "
-            "REDDIT_CLIENT_ID y REDDIT_CLIENT_SECRET (app 'script' gratis en "
-            "reddit.com/prefs/apps, se crea al instante y sin aprobación)"
+            f"_fetch_post_json error: {e} — si esto es un 403 desde GitHub "
+            "Actions es lo esperado: Reddit bloquea el .json anónimo desde IPs "
+            "de datacenter. La vía que sí funciona es configurar los secrets "
+            "REDDIT_CLIENT_ID y REDDIT_CLIENT_SECRET (app tipo 'script' en "
+            "reddit.com/prefs/apps: gratis, instantánea, sin aprobación)"
         )
     return None
 
