@@ -29,8 +29,37 @@ REDDIT_CLIENT_ID     = os.environ.get("REDDIT_CLIENT_ID",     "")
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
 REDDIT_UA            = "script:mediabot:2.0 (bot personal de Telegram)"
 
+# PROBADO Y DESCARTADO (2026-08-01): el truco de redlib de pedir el grant
+# "installed_client" haciéndose pasar por la app de Android — para no tener que
+# registrar app — devuelve 401 Unauthorized. El client_id que publica redlib ya
+# no lo acepta Reddit. Si alguien lo reintenta: sacar el client_id VIGENTE del
+# oauth.rs de redlib y probarlo aislado ANTES de cablearlo aquí; no asumir que
+# sigue sirviendo. Mientras tanto, la única vía confiable desde una IP de
+# datacenter son REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET.
+
 PROXY   = os.environ.get("PROXY_URL", "")
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else {}
+
+# Plataformas que van SIN proxy aunque PROXY_URL esté puesto.
+# TikTok es el caso probado (2026-08-01): desde la IP de GitHub baja perfecto,
+# pero a la IP del proxy residencial le sirve una página distinta y yt-dlp
+# revienta con "Unable to extract universal data for rehydration". Como TikTok
+# nunca necesitó el proxy, se le manda directo y así no perdemos una que ya
+# funcionaba por arreglar otra.
+# Ajustable sin tocar código con la variable PROXY_SKIP (lista con comas);
+# poner PROXY_SKIP vacío hace que TODO pase por el proxy.
+PROXY_SKIP = {
+    p.strip().lower()
+    for p in os.environ.get("PROXY_SKIP", "tiktok").split(",")
+    if p.strip()
+}
+
+
+def _proxy_for(platform: str | None) -> str:
+    """Proxy que le toca a esta plataforma ("" = conexión directa)."""
+    if platform and platform.lower() in PROXY_SKIP:
+        return ""
+    return PROXY
 
 _PATHS = {
     "instagram": "/tmp/ig_cookies.txt",
@@ -1173,6 +1202,18 @@ def download_threads(url: str) -> tuple[str | None, dict | None]:
 # Instagram  ──  fallback de fotos vía página de embed
 # ═══════════════════════════════════════════════════════════════════
 
+# PROBADO Y DESCARTADO (2026-08-01): los espejos públicos estilo fxtwitter para
+# Instagram (InstaFix y clones) están muertos. Verificado uno por uno:
+#   d.ddinstagram.com, d.kkinstagram.com, d.instagramfix.com → el dominio ya no
+#     resuelve; el proyecto se apagó.
+#   d.instagramez.com → PELIGRO: el dominio lo agarró un tercero y ahora
+#     redirige a una red de anuncios (effectivegatecpm.com). No usarlo.
+#   d.vxinstagram.com → vivo, pero devuelve HTML, no el archivo directo.
+# Si algún día alguien quiere reintentarlo: probar el host AISLADO y confirmar
+# que el Content-Type sea video/* o image/* antes de cablearlo. El fallback de
+# embed de aquí abajo sigue siendo el que funciona.
+
+
 def _instagram_image_fallback(url: str) -> tuple[str | None, dict | None]:
     """El extractor de Instagram de yt-dlp solo saca VIDEO; para posts de foto
     intentamos la página de embed, que es menos estricta con el login."""
@@ -1275,8 +1316,9 @@ def _ytdlp_generic(url: str, platform: str, cookies: str | None
         "nocheckcertificate":  True,
         "format":              "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
     }
-    if PROXY:
-        opts["proxy"] = PROXY
+    _prox = _proxy_for(platform)
+    if _prox:
+        opts["proxy"] = _prox
     if cookies:
         opts["cookiefile"] = cookies
 
@@ -1699,6 +1741,17 @@ def _reddit_oauth_token() -> str | None:
     return None
 
 
+def _reddit_api_get(post_id: str, token: str, ua: str) -> dict | None:
+    """Pide un post a oauth.reddit.com con el token que sea (oficial o anónimo)."""
+    r = requests.get(
+        f"https://oauth.reddit.com/comments/{post_id}?raw_json=1",
+        headers={"Authorization": f"Bearer {token}", "User-Agent": ua},
+        proxies=PROXIES, timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()[0]["data"]["children"][0]["data"]
+
+
 def _resolve_reddit_url(url: str) -> str:
     """Resuelve share-links (/r/<sub>/s/<token>) y acortadores redd.it
     al link real del post (son un redirect)."""
@@ -1725,23 +1778,18 @@ def _fetch_post_json(url: str) -> dict | None:
     url   = _resolve_reddit_url(url)
     clean = re.split(r"[?#]", url)[0].rstrip("/")
 
-    # 1) API oficial con OAuth: la vía confiable desde IPs de datacenter
-    token = _reddit_oauth_token()
-    if token:
-        m = re.search(r"/comments/([a-z0-9]+)", clean, re.IGNORECASE)
-        if m:
+    m = re.search(r"/comments/([a-z0-9]+)", clean, re.IGNORECASE)
+    post_id = m.group(1) if m else None
+
+    # 1) API oficial con OAuth, si hay credenciales de app configuradas.
+    #    Es la vía soportada y la más estable; se prueba primero.
+    if post_id and REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
+        token = _reddit_oauth_token()
+        if token:
             try:
-                r = requests.get(
-                    f"https://oauth.reddit.com/comments/{m.group(1)}?raw_json=1",
-                    headers={"Authorization": f"Bearer {token}",
-                             "User-Agent": REDDIT_UA},
-                    timeout=20,
-                )
-                r.raise_for_status()
-                data = r.json()
-                return data[0]["data"]["children"][0]["data"]
+                return _reddit_api_get(post_id, token, REDDIT_UA)
             except Exception as e:
-                logger.warning(f"_fetch_post_json oauth: {e}")
+                logger.warning(f"_fetch_post_json oauth app: {e}")
 
     # 2) .json público — Reddit lo bloquea (403) desde muchas IPs de
     #    datacenter; con huella de Chrome real a veces pasa.
@@ -1758,9 +1806,11 @@ def _fetch_post_json(url: str) -> dict | None:
         return data[0]["data"]["children"][0]["data"]
     except Exception as e:
         logger.error(
-            f"_fetch_post_json error: {e} — si esto es un 403 en GitHub Actions, "
-            "crea una app gratis en reddit.com/prefs/apps y configura los secrets "
-            "REDDIT_CLIENT_ID y REDDIT_CLIENT_SECRET"
+            f"_fetch_post_json error: {e} — si esto es un 403 desde GitHub "
+            "Actions es lo esperado: Reddit bloquea el .json anónimo desde IPs "
+            "de datacenter. La vía que sí funciona es configurar los secrets "
+            "REDDIT_CLIENT_ID y REDDIT_CLIENT_SECRET (app tipo 'script' en "
+            "reddit.com/prefs/apps: gratis, instantánea, sin aprobación)"
         )
     return None
 

@@ -1,6 +1,12 @@
 python-telegram-bot==21.5
 yt-dlp
 bgutil-ytdlp-pot-provider
+# Último recurso para YouTube: cuando YouTube contesta "inicia sesión para
+# confirmar que no eres un robot", este plugin reintenta solo a través de un
+# espejo público de Invidious. No hay que llamarlo desde el código: se engancha
+# a yt-dlp con solo estar instalado. Ojo: los espejos también los bloquean, así
+# que es una red de seguridad, no una garantía.
+yt-dlp-invidious
 requests>=2.31.0
 curl_cffi>=0.7.0
 playwright>=1.44.0
