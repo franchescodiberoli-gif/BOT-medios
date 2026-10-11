@@ -10,6 +10,7 @@ on:
 
 permissions:
   actions: write
+  contents: write   # para el commit keepalive
 
 # Nunca dos bots a la vez: Telegram da error 409 si hay dos polling del mismo
 # token. Una corrida nueva espera en cola a que termine la actual.
@@ -94,6 +95,22 @@ jobs:
           if [ "$ELAPSED" -lt 300 ]; then
             echo "::error::El bot murió a los ${ELAPSED}s — revisa los logs de arriba"
             exit 1
+          fi
+
+      # GitHub APAGA los workflows con cron si el repo pasa 60 días sin
+      # commits (le pasó a este bot el 2026-09: la cadena moría con "HTTP 422:
+      # Cannot trigger a 'workflow_dispatch' on a disabled workflow" y el bot
+      # quedó mudo). Si el último commit tiene más de 30 días, dejamos uno
+      # vacío para que el repo cuente como activo. No frena el relanzamiento.
+      - name: Mantener vivo el repo (regla de 60 días de GitHub)
+        run: |
+          AGE_DAYS=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "Último commit hace ${AGE_DAYS} días"
+          if [ "$AGE_DAYS" -ge 30 ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive: evitar que GitHub apague el workflow por inactividad"
+            git push || echo "::warning::No se pudo empujar el commit keepalive"
           fi
 
       - name: Relanzar siguiente corrida
